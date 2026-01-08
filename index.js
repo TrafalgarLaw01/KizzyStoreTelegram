@@ -3,6 +3,10 @@ const fs = require('fs');
 const express = require('express');
 const { MercadoPagoConfig, Payment } = require('mercadopago');
 
+const SUPORTE_WHATSAPP = "https://wa.me/67996931430?text=" +
+  encodeURIComponent("Opa, vim pela Kizzy Store, preciso de suporte!");
+
+
 process.on('unhandledRejection', (reason) => {
   console.error('PROMISE NÃO TRATADA:', reason);
 });
@@ -85,9 +89,18 @@ app.post('/webhook/mercadopago', async (req, res) => {
 
 
 
-const bot = new TelegramBot(TOKEN);
+const bot = new TelegramBot(TOKEN, { webhook: true });
 
 // ================= UTIL =================
+function registrarUsuario(chatId) {
+  let usuarios = ler('usuarios.json', {});
+  if (!usuarios[chatId]) {
+    usuarios[chatId] = { saldo: 0, carrinho: 1 };
+    salvar('usuarios.json', usuarios);
+  }
+}
+
+
 const ler = (arq, padrao = {}) => {
   if (!fs.existsSync(arq)) {
     fs.writeFileSync(arq, JSON.stringify(padrao, null, 2));
@@ -101,7 +114,7 @@ const salvar = (arq, data) =>
 
 
 if (!process.env.RENDER_EXTERNAL_URL) {
-    console.error('RENDER_EXTERNAL_RUL não definido');
+    console.error('RENDER_EXTERNAL_URL não definido');
     process.exit(1);
   }
 
@@ -117,6 +130,48 @@ app.post(`/bot${TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
+
+function getPreco() {
+const config = ler('config.json', { preco: 0.70});
+  return Number(config.preco) || 0.70;
+}
+
+function setPreco(valor) {
+  salvar('config.json', { preco: valor });
+}
+
+function broadcastEstoque() {
+  const usuarios = ler('usuarios.json', {});
+  const estoque = estoqueDisponivel();
+
+  Object.keys(usuarios).forEach(chatId => {
+    bot.sendMessage(
+      chatId,
+      `📢 *Estoque Abastecido!*
+
+📦 Contas disponíveis no bot
+📊 Estoque: ${estoque}
+
+👉 Use /start`,
+      { parse_mode: 'Markdown' }
+    ).catch(err => {
+      console.log(`falha ao enviar broadcast para ${chatId}`);
+  });
+  });
+}
+
+function limparVendidas() {
+  let estoque = ler('estoque.json', { contas: [] });
+
+  const antes = estoque.contas.length;
+  estoque.contas = estoque.contas.filter(c => !c.vendida);
+  const depois = estoque.contas.length;
+
+  salvar('estoque.json', estoque);
+
+  console.log(`🧹 Limpeza estoque: ${antes - depois} contas removidas`);
+}
+
 
 
 // ================= USUÁRIOS =================
@@ -192,18 +247,26 @@ async function criarPix(valor, userId) {
 
 // ================= ESTADOS =================
 let aguardandoValorRecarga = {};
+let aguardandoContaAdmin = {};
+let aguardandoRemocao = {};
+let PRECO_ATUAL = getPreco();
 
 // ================= START =================
 bot.onText(/\/start/, (msg) => {
-  getUsuario(msg.chat.id);
-  bot.sendMessage(msg.chat.id,
-    '🛒 Bot de Vendas\n\n💰 Use saldo para comprar',
+  const chatId = msg.chat.id;
+  getUsuario(chatId);
+
+  bot.sendMessage(
+    chatId,
+    '🛒 *Kizzy Store*\n\n💰 Use seu saldo para comprar contas.',
     {
+      parse_mode: 'Markdown',
       reply_markup: {
         keyboard: [
           ['💰 Meu saldo'],
           ['🛒 Comprar contas'],
-          ['➕ Recarregar saldo']
+          ['➕ Recarregar saldo'],
+          ['🆘 Suporte']
         ],
         resize_keyboard: true
       }
@@ -211,32 +274,85 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
+
+
+
 // ================= MENSAGENS =================
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
+  registrarUsuario(chatId);
   const user = getUsuario(chatId);
+  if (msg.text === '🆘 Suporte') {
+  bot.sendMessage(
+    chatId,
+    '🆘 *Suporte Kizzy Store*\n\nClique no botão abaixo:',
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '💬 Falar no WhatsApp', url: SUPORTE_WHATSAPP }]
+        ]
+      }
+    }
+  );
+  return;
+}
+
   //ADMIN - ADICIONAR CONTA
+  if (aguardandoRemocao[chatId] && chatId === ADMIN_ID) {
+  const indices = msg.text
+    .split(',')
+    .map(n => parseInt(n.trim()) - 1)
+    .filter(n => !isNaN(n));
+
+  let estoque = ler('estoque.json', { contas: [] });
+
+  indices.sort((a, b) => b - a).forEach(i => {
+    if (estoque.contas[i]) estoque.contas.splice(i, 1);
+  });
+
+  salvar('estoque.json', estoque);
+  aguardandoRemocao[chatId] = false;
+
+  bot.sendMessage(chatId, '✅ Contas removidas com sucesso.');
+  return;
+}
   if (aguardandoContaAdmin[chatId] && chatId === ADMIN_ID){
     if (!msg.text.includes(':')) {
       bot.sendMessage(chatId, '❌ Formato inválido. Use login:senha');
       return;
     }
 
-    const [login, senha] = msg.text.split(':');
 
-    const estoque = ler('estoque.json', { contas: [] });
+
+    const linhas = msg.text.split('\n');
+
+const estoque = ler('estoque.json', { contas: [] });
+let adicionadas = 0;
+
+linhas.forEach(linha => {
+  if (linha.includes(':')) {
+    const [login, senha] = linha.split(':');
     estoque.contas.push({
       login: login.trim(),
       senha: senha.trim(),
       vendida: false
     });
-
-    salvar('estoque.json', estoque);
-    aguardandoContaAdmin[chatId] = false;
-
-    bot.sendMessage(chatId, '✅ Conta adicionada ao estoque!');
-    return;
+    adicionadas++;
   }
+});
+
+salvar('estoque.json', estoque);
+aguardandoContaAdmin[chatId] = false;
+
+bot.sendMessage(chatId,
+  `✅ ${adicionadas} contas adicionadas ao estoque.`
+);
+
+broadcastEstoque();
+return;
+  }
+
 
   // RECARREGAR
   if (msg.text === '➕ Recarregar saldo') {
@@ -309,6 +425,11 @@ await bot.sendPhoto(chatId, qrBuffer, {
   // COMPRAR
   if (msg.text === '🛒 Comprar contas') {
     const estoque = estoqueDisponivel();
+    if (estoque === 0) {
+  bot.sendMessage(chatId, '⚠️ Estoque esgotado no momento.');
+  return;
+}
+
     bot.sendMessage(chatId,
       `📦 Conta Premium\n` +
       `💵 Preço: R$${PRECO_ATUAL.toFixed(2)}\n` +
@@ -338,6 +459,15 @@ bot.on('callback_query', (query) => {
       return;
     }
 
+    if (user.carrinho > estoqueDisponivel()) {
+  bot.answerCallbackQuery(query.id, {
+    text: 'Estoque insuficiente no momento',
+    show_alert: true
+  });
+  return;
+}
+
+
     const contas = retirarContas(user.carrinho);
     user.saldo -= total;
     user.carrinho = 1;
@@ -365,12 +495,9 @@ bot.on('callback_query', (query) => {
 
 // ================= ADMIN =================
 
-let aguardandoContaAdmin = {};
-let PRECO_ATUAL = 0.70;
 
 bot.onText(/\/admin/, (msg) => {
   const chatId = msg.chat.id;
-
   if (chatId !== ADMIN_ID) {
     bot.sendMessage(chatId, '⛔ Acesso negado. Você não é admin.');
     return;
@@ -380,10 +507,20 @@ bot.onText(/\/admin/, (msg) => {
     '🔧 *PAINEL ADMIN*\n\n' +
     'Escolha uma opção:\n\n' +
     '📦 /estoque → Ver estoque\n' +
-    '➕ /addconta → Adicionar conta',
+    '➕ /addconta → Adicionar conta' +
+    '🗑 /Remover contas',
     { parse_mode: 'Markdown' }
   );
 });
+
+//LIMPAR VENDIDAS
+bot.onText(/\/limparvendidas/, (msg) => {
+  if (msg.chat.id !== ADMIN_ID) return;
+
+  limparVendidas();
+  bot.sendMessage(msg.chat.id, '🧹 Contas vendidas removidas do estoque.');
+});
+
 
 // VER ESTOQUE
 bot.onText(/\/estoque/, (msg) => {
@@ -414,6 +551,7 @@ bot.onText(/\/addconta/, (msg) => {
   );
 });
 
+
 // ALTERAR PREÇO
 bot.onText(/\/setpreco (.+)/, (msg, match) => {
   if (msg.chat.id !== ADMIN_ID) return;
@@ -426,11 +564,39 @@ bot.onText(/\/setpreco (.+)/, (msg, match) => {
   }
 
   PRECO_ATUAL = novoPreco;
+  setPreco(novoPreco);
 
   bot.sendMessage(msg.chat.id,
     `✅ Preço atualizado com sucesso!\n\n💵 Novo valor: R$${PRECO_ATUAL.toFixed(2)}`
   );
 });
+
+// REMOVER MULTIPLAS CONTAS
+
+bot.onText(/\/removercontas/, (msg) => {
+  if (msg.chat.id !== ADMIN_ID) return;
+
+  const estoque = ler('estoque.json', { contas: [] });
+  if (estoque.contas.length === 0) {
+    bot.sendMessage(msg.chat.id, '⚠️ Estoque vazio.');
+    return;
+  }
+
+  let texto = '*📦 Contas no estoque:*\n\n';
+  estoque.contas.forEach((c, i) => {
+    if (!c.vendida) {
+      texto += `${i + 1} = ${c.login}:${c.senha}\n`;
+    }
+  });
+
+  texto += '\n✍️ Envie os números separados por vírgula.\nEx: 1,2,3';
+
+  aguardandoRemocao[msg.chat.id] = true;
+
+  bot.sendMessage(msg.chat.id, texto, { parse_mode: 'Markdown' });
+});
+
+
 
 
 
