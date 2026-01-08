@@ -8,8 +8,14 @@ process.on('unhandledRejection', (reason) => {
 
 
 // ================= CONFIG =================
-const BOT_TOKEN = '8589813075:AAF-U5Z7e_yaVF__JtgDqCcWzzti6bbusj4';
+const TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = 1510068690;
+const app = express();
+
+if (!TOKEN) {
+  console.error('BOT_TOKEN não definido');
+  process.exit(1);
+}
 
 
 const client = new MercadoPagoConfig({
@@ -19,7 +25,8 @@ const client = new MercadoPagoConfig({
 const payment = new Payment(client);
 
 
-const bot = new TelegramBot(BOT_TOKEN);
+const bot = new TelegramBot(TOKEN);
+app.use(express.json());
 
 // ================= UTIL =================
 const ler = (arq) => {
@@ -31,21 +38,16 @@ const salvar = (arq, data) =>
   fs.writeFileSync(arq, JSON.stringify(data, null, 2));
 
 const express = require('express');
-const app = express();
 
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL + `/bot${TOKEN}`;
 
+bot.setWebHook(WEBHOOK_URL)
+  .then(() => console.log('erbhook configurado:', WEBHOOK_URL))
+  .catch(erro => console.error('erro ao configurar webhook:', err));
 
-const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL + `/bot${BOT_TOKEN}`;
-
-bot.setWebHook(WEBHOOK_URL);
-
-app.post(`/bot${BOT_TOKEN}`, (req, res) => {
+app.post(`/bot${TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
@@ -348,6 +350,10 @@ bot.on('message', (msg) => {
   bot.sendMessage(chatId, '✅ Conta adicionada ao estoque!');
 });
 
-require('./server');
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Servidor HTTP rodando na porta ${PORT}`);
+});
+
 
 
