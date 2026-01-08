@@ -41,11 +41,11 @@ app.listen(PORT, () => {
 });
 
 
-const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL + `/bot${TOKEN}`;
+const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL + `/bot${BOT_TOKEN}`;
 
 bot.setWebHook(WEBHOOK_URL);
 
-app.post(`/bot${TOKEN}`, (req, res) => {
+app.post(`/bot${BOT_TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
