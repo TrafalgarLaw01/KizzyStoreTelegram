@@ -1,5 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
+const express = require('express');
 const { MercadoPagoConfig, Payment } = require('mercadopago');
 
 process.on('unhandledRejection', (reason) => {
@@ -9,7 +10,7 @@ process.on('unhandledRejection', (reason) => {
 
 // ================= CONFIG =================
 const TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = 1510068690;
+const ADMIN_ID = Number(process.env.ADMIN_ID);
 const app = express();
 
 if (!TOKEN) {
@@ -19,33 +20,46 @@ if (!TOKEN) {
 
 
 const client = new MercadoPagoConfig({
-  accessToken: 'APP_USR-4806665999726140-010813-53d60c1686c0b8598c0b6b1d5e1a0a61-357031441'
+  accessToken: process.env.MP_ACCESS_TOKEN
 });
+
+if (!process.env.MP_ACCESS_TOKEN) {
+  console.error('MP_ACCESS_TOKEN não definido');
+  process.exit(1);
+}
 
 const payment = new Payment(client);
 
 
 const bot = new TelegramBot(TOKEN);
-app.use(express.json());
 
 // ================= UTIL =================
-const ler = (arq) => {
-  if (!fs.existsSync(arq)) fs.writeFileSync(arq, JSON.stringify({}));
+const ler = (arq, padrao = {}) => {
+  if (!fs.existsSync(arq)) {
+    fs.writeFileSync(arq, JSON.stringify(padrao, null, 2));
+    return padrao;
+}
   return JSON.parse(fs.readFileSync(arq));
 };
 
 const salvar = (arq, data) =>
   fs.writeFileSync(arq, JSON.stringify(data, null, 2));
 
-const express = require('express');
 
 app.use(express.json());
 
-const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL + `/bot${TOKEN}`;
+if (!process.env.RENDER_EXTERNAL_URL) {
+    console.error('RENDER_EXTERNAL_RUL não definido');
+    process.exit(1);
+  }
+
+const WEBHOOK_URL = 
+  `${process.env.RENDER_EXTERNAL_URL}/bot${TOKEN}`;
+  
 
 bot.setWebHook(WEBHOOK_URL)
-  .then(() => console.log('erbhook configurado:', WEBHOOK_URL))
-  .catch(erro => console.error('erro ao configurar webhook:', err));
+  .then(() => console.log('webhook configurado:', WEBHOOK_URL))
+  .catch(err => console.error('erro ao configurar webhook:', err));
 
 app.post(`/bot${TOKEN}`, (req, res) => {
   bot.processUpdate(req.body);
@@ -55,7 +69,7 @@ app.post(`/bot${TOKEN}`, (req, res) => {
 
 // ================= USUÁRIOS =================
 function getUsuario(chatId) {
-  const usuarios = ler('usuarios.json');
+  let usuarios = ler('usuarios.json', {});
   if (!usuarios[chatId]) {
     usuarios[chatId] = { saldo: 0, carrinho: 1 };
     salvar('usuarios.json', usuarios);
@@ -64,21 +78,26 @@ function getUsuario(chatId) {
 }
 
 function atualizarUsuario(chatId, dados) {
-  const usuarios = ler('usuarios.json');
+  let usuarios = ler('usuarios.json', {});
   usuarios[chatId] = dados;
   salvar('usuarios.json', usuarios);
 }
 
 // ================= ESTOQUE =================
 function estoqueDisponivel() {
-  const estoque = ler('estoque.json');
+  let estoque = ler('estoque.json', { contas: [] });
   if (!estoque.contas) estoque.contas = [];
   return estoque.contas.filter(c => !c.vendida).length;
 }
 
 function retirarContas(qtd) {
-  const estoque = ler('estoque.json');
-  const disponiveis = estoque.contas.filter(c => !c.vendida).slice(0, qtd);
+  let estoque = ler('estoque.json', { contas: [] });
+  if (!estoque.contas) estoque.contas = [];
+
+  const disponiveis = estoque.contas
+    .filter(c => !c.vendida)
+    .slice(0, qtd);
+  
   disponiveis.forEach(c => c.vendida = true);
   salvar('estoque.json', estoque);
   return disponiveis;
@@ -144,6 +163,28 @@ bot.onText(/\/start/, (msg) => {
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const user = getUsuario(chatId);
+  //ADMIN - ADICIONAR CONTA
+  if (aguardandoContaAdmin[chatId] && chatId === ADMIN_ID){
+    if (!msg.text.includes(':')) {
+      bot.sendMessage(chatId, '❌ Formato inválido. Use login:senha');
+      return;
+    }
+
+    const [login, senha] = msg.text.split(':');
+
+    const estoque = ler('estoque.json', { contas: [] });
+    estoque.contas.push({
+      login: login.trim(),
+      senha: senha.trim(),
+      vendida: false
+    });
+
+    salvar('estoque.json', estoque);
+    aguardandoContaAdmin[chatId] = false;
+
+    bot.sendMessage(chatId, '✅ Conta adicionada ao estoque!');
+    return;
+  }
 
   // RECARREGAR
   if (msg.text === '➕ Recarregar saldo') {
@@ -169,7 +210,7 @@ bot.on('message', async (msg) => {
     try {
   const pix = await criarPix(valor, chatId);
 
-  let recargas = ler('recargas.json');
+  let recargas = ler('recargas.json', []);
   if (!Array.isArray(recargas)) recargas = [];
 
   recargas.push({
@@ -295,7 +336,7 @@ bot.onText(/\/admin/, (msg) => {
 bot.onText(/\/estoque/, (msg) => {
   if (msg.chat.id !== ADMIN_ID) return;
 
-  const estoque = ler('estoque.json');
+  const estoque = ler('estoque.json', { contas: [] });
   const total = estoque.contas?.length || 0;
   const disponiveis = estoque.contas?.filter(c => !c.vendida).length || 0;
 
@@ -320,35 +361,6 @@ bot.onText(/\/addconta/, (msg) => {
   );
 });
 
-// RECEBER CONTA
-bot.on('message', (msg) => {
-  const chatId = msg.chat.id;
-
-  if (!aguardandoContaAdmin[chatId]) return;
-  if (chatId !== ADMIN_ID) return;
-
-  if (!msg.text.includes(':')) {
-    bot.sendMessage(chatId, '❌ Formato inválido. Use login:senha');
-    return;
-  }
-
-  const [login, senha] = msg.text.split(':');
-
-  const estoque = ler('estoque.json');
-  if (!estoque.contas) estoque.contas = [];
-
-  estoque.contas.push({
-    login: login.trim(),
-    senha: senha.trim(),
-    vendida: false
-  });
-
-  salvar('estoque.json', estoque);
-
-  aguardandoContaAdmin[chatId] = false;
-
-  bot.sendMessage(chatId, '✅ Conta adicionada ao estoque!');
-});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
