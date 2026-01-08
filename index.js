@@ -19,7 +19,7 @@ const client = new MercadoPagoConfig({
 const payment = new Payment(client);
 
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN);
 
 // ================= UTIL =================
 const ler = (arq) => {
@@ -29,6 +29,27 @@ const ler = (arq) => {
 
 const salvar = (arq, data) =>
   fs.writeFileSync(arq, JSON.stringify(data, null, 2));
+
+const express = require('express');
+const app = express();
+
+app.use(express.json());
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+
+const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL + `/bot${TOKEN}`;
+
+bot.setWebHook(WEBHOOK_URL);
+
+app.post(`/bot${TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
 
 // ================= USUÁRIOS =================
 function getUsuario(chatId) {
