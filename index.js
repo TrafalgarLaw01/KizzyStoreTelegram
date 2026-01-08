@@ -327,3 +327,6 @@ bot.on('message', (msg) => {
   bot.sendMessage(chatId, '✅ Conta adicionada ao estoque!');
 });
 
+require('./server');
+
+
