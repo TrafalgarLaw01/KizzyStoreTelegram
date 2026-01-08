@@ -1,0 +1,26 @@
+{
+  "produto": "Conta Outlook",
+  "preco": 1,
+  "contas": [
+    {
+      "login": "conta01@email.com",
+      "senha": "123",
+      "vendida": false
+    },
+    {
+      "login": "conta02@email.com",
+      "senha": "456",
+      "vendida": false
+    },
+    {
+      "login": "conta03@email.com",
+      "senha": "789",
+      "vendida": false
+    },
+    {
+      "login": "login@outlook.com",
+      "senha": "12345678",
+      "vendida": false
+    }
+  ]
+}
