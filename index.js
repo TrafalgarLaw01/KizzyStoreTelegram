@@ -12,6 +12,8 @@ process.on('unhandledRejection', (reason) => {
 const TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = Number(process.env.ADMIN_ID);
 const app = express();
+app.use(express.json());
+
 
 if (!TOKEN) {
   console.error('BOT_TOKEN não definido');
@@ -30,6 +32,58 @@ if (!process.env.MP_ACCESS_TOKEN) {
 
 const payment = new Payment(client);
 
+app.post('/webhook/mercadopago', async (req, res) => {
+  try {
+    const { type, data } = req.body;
+
+    if (type !== 'payment') {
+      return res.sendStatus(200);
+    }
+
+    const paymentId = data.id;
+
+    const mpPayment = await payment.get({ id: paymentId });
+
+    if (mpPayment.status !== 'approved') {
+      return res.sendStatus(200);
+    }
+
+    let recargas = ler('recargas.json', []);
+    if (!Array.isArray(recargas)) recargas = [];
+
+    const recarga = recargas.find(r => r.paymentId == paymentId);
+
+    if (!recarga || recarga.status === 'APROVADO') {
+      return res.sendStatus(200);
+    }
+
+    // MARCA COMO APROVADO
+    recarga.status = 'APROVADO';
+
+    // CREDITAR SALDO
+    const user = getUsuario(recarga.chatId);
+    user.saldo += recarga.valor;
+    atualizarUsuario(recarga.chatId, user);
+
+    salvar('recargas.json', recargas);
+
+    // AVISAR USUÁRIO
+    bot.sendMessage(recarga.chatId,
+      `✅ *Pagamento confirmado!*\n\n` +
+      `💰 Valor creditado: R$${recarga.valor.toFixed(2)}\n` +
+      `💳 Saldo atual: R$${user.saldo.toFixed(2)}`,
+      { parse_mode: 'Markdown' }
+    );
+
+    res.sendStatus(200);
+
+  } catch (err) {
+    console.error('Erro webhook MP:', err);
+    res.sendStatus(500);
+  }
+});
+
+
 
 const bot = new TelegramBot(TOKEN);
 
@@ -45,8 +99,6 @@ const ler = (arq, padrao = {}) => {
 const salvar = (arq, data) =>
   fs.writeFileSync(arq, JSON.stringify(data, null, 2));
 
-
-app.use(express.json());
 
 if (!process.env.RENDER_EXTERNAL_URL) {
     console.error('RENDER_EXTERNAL_RUL não definido');
@@ -259,7 +311,7 @@ await bot.sendPhoto(chatId, qrBuffer, {
     const estoque = estoqueDisponivel();
     bot.sendMessage(chatId,
       `📦 Conta Premium\n` +
-      `💵 Preço: R$1,00\n` +
+      `💵 Preço: R$${PRECO_ATUAL.toFixed(2)}\n` +
       `📊 Estoque: ${estoque}`,
       { reply_markup: tecladoQuantidade(user.carrinho) }
     );
@@ -276,7 +328,7 @@ bot.on('callback_query', (query) => {
   if (query.data === 'menos' && user.carrinho > 1) user.carrinho--;
 
   if (query.data === 'comprar') {
-    const total = user.carrinho * 1;
+    const total = user.carrinho * PRECO_ATUAL;
 
     if (user.saldo < total) {
       bot.answerCallbackQuery(query.id, {
@@ -314,6 +366,7 @@ bot.on('callback_query', (query) => {
 // ================= ADMIN =================
 
 let aguardandoContaAdmin = {};
+let PRECO_ATUAL = 0.70;
 
 bot.onText(/\/admin/, (msg) => {
   const chatId = msg.chat.id;
@@ -360,6 +413,25 @@ bot.onText(/\/addconta/, (msg) => {
     { parse_mode: 'Markdown' }
   );
 });
+
+// ALTERAR PREÇO
+bot.onText(/\/setpreco (.+)/, (msg, match) => {
+  if (msg.chat.id !== ADMIN_ID) return;
+
+  const novoPreco = Number(match[1].replace(',', '.'));
+
+  if (isNaN(novoPreco) || novoPreco <= 0) {
+    bot.sendMessage(msg.chat.id, '❌ Preço inválido.');
+    return;
+  }
+
+  PRECO_ATUAL = novoPreco;
+
+  bot.sendMessage(msg.chat.id,
+    `✅ Preço atualizado com sucesso!\n\n💵 Novo valor: R$${PRECO_ATUAL.toFixed(2)}`
+  );
+});
+
 
 
 const PORT = process.env.PORT || 3000;
