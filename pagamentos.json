@@ -1,9 +1,0 @@
-[
-  {
-    "paymentId": "123456",
-    "chatId": 1515151515,
-    "quantidade": 3,
-    "status": "pending",
-    "processado": false
-  }
-]
