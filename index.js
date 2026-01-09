@@ -27,7 +27,13 @@ app.listen(PORT, HOST, () => {
 
 const uri = process.env.MONGODB_URI;
 
-const mongoClient = new MongoClient(uri, {
+// VERIFICAÇÃO DE SEGURANÇA DO MONGODB
+if (!uri) {
+  console.error("ERRO: VARIAVEL MONGOBD_URI não foi encontrada");
+  console.error("verifique se ela esta salva no painel");
+}
+
+const mongoClient = new MongoClient(uri || "mongodb://erro_configuracao_painel", {
   serverApi: {
     version: ServerApiVersion.v1,
     strict: true,
@@ -581,3 +587,5 @@ async function broadcast() {
 }
 }
 startApp();
+
+//commit forçando atualização
