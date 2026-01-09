@@ -3,12 +3,34 @@ const { MongoClient, ServerApiVersion } = require('mongodb');
 const { MercadoPagoConfig, Payment } = require('mercadopago');
 const express = require('express');
 
+const app = express = require('express');
+
+app.use(express.json());
+
 const bot = new TelegramBot(process.env.BOT_TOKEN);
 const mpClient = new MercadoPagoConfig({
   accessToken: process.env.MP_ACCESS_TOKEN
 });
 
 const payment = new Payment(mpClient);
+
+/* ================ EXPRESS =============== */
+app.get('/', (req, res) => {
+  res.send('Kizzy store Online');
+});
+
+app.post('/webhook/mercadopago', async (req, res) => {
+  console.log('Webhook recebido:', req.body);
+
+  //validação pagamento
+  res.sendStatus(200);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`webhook reodando na porta ${PORT}`);
+});
+
 
 /* ================= MONGO ================= */
 
