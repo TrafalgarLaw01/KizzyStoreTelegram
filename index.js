@@ -16,13 +16,6 @@ app.get('/', (req, res) => {
   res.send('Kizzy store Online');
 });
 
-app.post('/webhook/mercadopago', async (req, res) => {
-  console.log('Webhook  MP recebido:', req.body);
-
-  //validação pagamento
-  res.sendStatus(200);
-});
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`webhook rodando na porta ${PORT}`);
@@ -121,6 +114,7 @@ async function criarPix(chatId, valor) {
 }
 
   const res = await payment.create({
+    body: {
     transaction_amount: Number(valor.toFixed(2)),
     description: 'Adicionar saldo - Kizzy Store',
     payment_method_id: 'pix',
@@ -128,6 +122,7 @@ async function criarPix(chatId, valor) {
       email: `user${chatId}@kizzystore.com`
     },
     notification_url: `${process.env.BASE_URL}/webhook/mercadopago`
+  }
   });
 
   await pagamentos().insertOne({
