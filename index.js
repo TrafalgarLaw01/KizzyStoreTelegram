@@ -16,8 +16,9 @@ app.get('/', (req, res) => {
   res.send('Kizzy store Online');
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const PORT = process.env.PORT || 80;
+const HOST = '0.0.0.0';
+app.listen(PORT, HOST, () => {
   console.log(`webhook rodando na porta ${PORT}`);
 });
 
