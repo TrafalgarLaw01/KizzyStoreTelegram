@@ -41,6 +41,7 @@ const mongoClient = new MongoClient(uri, {
   }
 });
 let db;
+let bot;
 
 async function startMongo() {
   try {
@@ -109,6 +110,20 @@ function menuPrincipal(user) {
     }
   };
 }
+/* ============ START BOT ==========*/
+async function startApp() {
+  // 1. Mongo primeiro
+  await startMongo();
+
+  // 2. Bot depois
+  const TelegramBot = require('node-telegram-bot-api');
+  bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+
+  console.log('BOT TELEGRAM ONLINE (polling ativo)');
+}
+
+startApp();
+
 
 /* ================= START ================= */
 
@@ -325,16 +340,3 @@ async function broadcast() {
     );
   }
 }
-
-async function startApp() {
-  // 1. Mongo primeiro
-  await startMongo();
-
-  // 2. Bot depois
-  const TelegramBot = require('node-telegram-bot-api');
-  bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
-
-  console.log('BOT TELEGRAM ONLINE (polling ativo)');
-}
-
-startApp();
