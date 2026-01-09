@@ -69,6 +69,8 @@ async function startApp() {
   const TelegramBot = require('node-telegram-bot-api');
   bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
+  await bot.deleteWebHook({ drop_pending_updates: true });
+
   console.log('BOT TELEGRAM ONLINE (polling ativo)');
 
 /*============ resposta pagamento =========== */
