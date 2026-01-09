@@ -112,6 +112,7 @@ async function criarPix(chatId, valor) {
     if (!Number.isFinite(valor) || valor <= 0) {
   throw new Error(`VALOR_INVALIDO_PIX: ${valor}`);
 }
+  console.log('URL de notificação:', `${process.env.BASE_URL}/webhook/mercadopago`);
 
   const res = await payment.create({
     body: {
