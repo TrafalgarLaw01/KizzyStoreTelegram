@@ -1,5 +1,5 @@
 const TelegramBot = require('node-telegram-bot-api');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ServerApiVersion } = require('mongodb');
 const { MercadoPagoConfig, Payment } = require('mercadopago');
 const express = require('express');
 
@@ -12,15 +12,30 @@ const payment = new Payment(mpClient);
 
 /* ================= MONGO ================= */
 
-const client = new MongoClient(process.env.MONGO_URI);
+const uri = process.env.MONGODB_URI;
+
+const mongoClient = new MongoClient(uri, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  }
+});
 let db;
 
 async function startMongo() {
-  await client.connect();
-  db = client.db();
+  try {
+  await mongoClient.connect();
+  db = mongoClient.db();
   console.log('Mongo conectado');
+} catch (err) {
+  console.error('Erro MongoDB:', err);
+  process.exit(1);
+}
 }
 startMongo();
+
+module.exports = { db };
 
 const users = () => db.collection('users');
 const estoque = () => db.collection('estoque');
