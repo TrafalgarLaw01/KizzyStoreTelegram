@@ -1,4 +1,3 @@
-const TelegramBot = require('node-telegram-bot-api');
 const { MongoClient, ServerApiVersion } = require('mongodb');
 const { MercadoPagoConfig, Payment } = require('mercadopago');
 const express = require('express');
@@ -6,11 +5,6 @@ const app = express();
 
 app.use(express.json());
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, {
-  polling: true
-});
-
-console.log('BOT TELEGRAM ONLINE (polling ativo)');
 const mpClient = new MercadoPagoConfig({
   accessToken: process.env.MP_ACCESS_TOKEN
 });
@@ -58,7 +52,6 @@ async function startMongo() {
   process.exit(1);
 }
 }
-startMongo();
 
 module.exports = { db };
 
@@ -66,6 +59,7 @@ const users = () => db.collection('users');
 const estoque = () => db.collection('estoque');
 const pagamentos = () => db.collection('pagamentos');
 const config = () => db.collection('config');
+
 
 /* ================= CONFIG PADRÃO ================= */
 
@@ -331,3 +325,16 @@ async function broadcast() {
     );
   }
 }
+
+async function startApp() {
+  // 1. Mongo primeiro
+  await startMongo();
+
+  // 2. Bot depois
+  const TelegramBot = require('node-telegram-bot-api');
+  bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+
+  console.log('BOT TELEGRAM ONLINE (polling ativo)');
+}
+
+startApp();
