@@ -66,49 +66,99 @@ async function startApp() {
 
   console.log('BOT TELEGRAM ONLINE (polling ativo)');
 
-/*============ resposta pagamento =========== */
+/*============ RESPOSTA PAGAMENTO (WEBHOOK ROBUSTO) =========== */
 app.post('/webhook/mercadopago', async (req, res) => {
+  // 1. Responder OK imediatamente para o MP não ficar tentando de novo
   res.sendStatus(200);
-  try{
-  const paymentId = req.body.data?.id;
-  const action = req.body.action;
 
-  if (!paymentId || (action !== 'payment.created' && action !== 'payment.updated')) return;
+  try {
+    // Log para ver o que chegou (Olhe isso nas logs da Render!)
+    console.log('🔔 Webhook recebido:', JSON.stringify(req.body, null, 2));
 
-  const mpData = await payment.get({ id: paymentId });
+    const action = req.body.action;
+    const type = req.body.type;
+    
+    // O ID pode vir em data.id ou data.id (dependendo da versão da API)
+    // Vamos garantir que pegamos o ID certo
+    let paymentId = req.body.data?.id; 
 
-  if (mpData.status === 'approved') {
-    const pag = await pagamentos().findOne({ paymentId });
+    // Se não tiver ID ou não for atualização de pagamento, ignora
+    if (!paymentId || (action !== 'payment.created' && action !== 'payment.updated')) {
+      console.log('⚠️ Webhook ignorado: Ação não é criação/atualização ou sem ID.');
+      return;
+    }
 
-    if (pag && !pag.confirmado) {
+    // Converter para string e número para garantir a busca no banco
+    const idString = String(paymentId);
+    const idNumber = Number(paymentId);
+
+    console.log(`🔎 Buscando no banco pelo ID: ${idString} (ou ${idNumber})`);
+
+    // Busca no banco tentando os dois formatos (Texto ou Número)
+    const pag = await pagamentos().findOne({
+      $or: [
+        { paymentId: idString },
+        { paymentId: idNumber }
+      ]
+    });
+
+    if (!pag) {
+      console.error('❌ Pagamento NÃO encontrado no Mongo. Verifique se o ID salvou corretamente na criação.');
+      return;
+    }
+
+    console.log('✅ Pagamento encontrado no banco:', pag._id);
+
+    if (pag.confirmado) {
+      console.log('⚠️ Pagamento já estava confirmado. Ignorando.');
+      return;
+    }
+
+    // Consulta status atualizado na API do Mercado Pago
+    // Importante: Passar o ID como obtido no webhook
+    const mpData = await payment.get({ id: paymentId });
+    console.log('💰 Status no Mercado Pago:', mpData.status);
+
+    if (mpData.status === 'approved') {
+      console.log('🚀 Pagamento APROVADO! Liberando saldo...');
+
+      // 1. Atualiza Saldo
       await users().updateOne(
         { chatId: pag.chatId },
         { $inc: { saldo: pag.valor } }
       );
 
+      // 2. Marca como confirmado
       await pagamentos().updateOne(
-        { paymentId },
+        { _id: pag._id }, // Usa o _id do mongo para garantir
         { $set: { confirmado: true, confirmadoEm: new Date() } }
       );
 
+      // 3. Apaga msg QR Code
       if (pag.msgPixId) {
         try {
           await bot.deleteMessage(pag.chatId, pag.msgPixId);
+          console.log('🗑️ Mensagem do QR Code apagada.');
         } catch (err) {
-          console.log('Não foi possivel apagar a msg do pix (provavavelmente muito antiga ou ja apagada)');
+          console.log('⚠️ Não deu para apagar mensagem (talvez já apagada).');
         }
       }
 
-      bot.sendMessage(
+      // 4. Avisa o usuário
+      await bot.sendMessage(
         pag.chatId,
         `✅ *Pagamento confirmado!*\n\n💰 + R$ ${pag.valor.toFixed(2)} adicionados ao seu saldo.`,
-        { parse_mode: 'markdown' }
+        { parse_mode: 'Markdown' }
       );
+      
+      console.log('🏁 Processo finalizado com sucesso.');
+    } else {
+        console.log(`ℹ️ Pagamento ainda não aprovado. Status: ${mpData.status}`);
     }
+
+  } catch (err) {
+    console.error('❌ ERRO CRÍTICO no Webhook:', err);
   }
-} catch (err){
-  console.error('erro no processamento do webhook:', err);
-}
 });
 
 
@@ -119,44 +169,59 @@ async function getPreco() {
   return cfg ? cfg.valor : 0.70;
 }
 
-/* ================ CRIAR PIX ============== */
+/* ================ CRIAR PIX (CORRIGIDO) ============== */
 
 async function criarPix(chatId, valor) {
   try {
     if (!Number.isFinite(valor) || valor <= 0) {
-  throw new Error(`VALOR_INVALIDO_PIX: ${valor}`);
-}
-  console.log('URL de notificação:', `${process.env.BASE_URL}/webhook/mercadopago`);
+      throw new Error(`VALOR_INVALIDO_PIX: ${valor}`);
+    }
 
-  const res = await payment.create({
-    body: {
-    transaction_amount: Number(valor.toFixed(2)),
-    description: 'Adicionar saldo - Kizzy Store',
-    payment_method_id: 'pix',
-    payer: {
-      email: `user${chatId}@kizzystore.com`
-    },
-    notification_url: `${process.env.BASE_URL}/webhook/mercadopago`
+    // 1. Cria a preferência no Mercado Pago
+    const res = await payment.create({
+      body: {
+        transaction_amount: Number(valor.toFixed(2)),
+        description: 'Adicionar saldo - Kizzy Store',
+        payment_method_id: 'pix',
+        payer: {
+          email: `user${chatId}@kizzystore.com`
+        },
+        notification_url: `${process.env.BASE_URL}/webhook/mercadopago`
+      }
+    });
+
+    // LOG DE DEBUG: Vamos ver o que o Mercado Pago devolveu
+    console.log('RESPOSTA CRIAÇÃO MP:', JSON.stringify(res, null, 2));
+
+    // 2. Extrai o ID com segurança (algumas versões retornam em .id, outras em .body.id)
+    const idPagamentoMP = res.id || res.body?.id; // Tenta pegar de todo jeito
+
+    if (!idPagamentoMP) {
+      throw new Error('O Mercado Pago não retornou um ID de pagamento!');
+    }
+
+    console.log(`✅ ID do Pagamento capturado: ${idPagamentoMP}`);
+
+    // 3. Salva a "PONTE" no MongoDB
+    await pagamentos().insertOne({
+      chatId: chatId,          // <--- Quem comprou (Telegram)
+      paymentId: idPagamentoMP, // <--- O número do recibo (Mercado Pago)
+      valor: valor,
+      status: res.status,
+      confirmado: false,       // Começa falso
+      criadoEm: new Date()
+    });
+
+    return {
+      id: idPagamentoMP,
+      qrCode: res.point_of_interaction.transaction_data.qr_code,
+      qrCodeBase64: res.point_of_interaction.transaction_data.qr_code_base64
+    };
+
+  } catch (err) {
+    console.error('❌ Erro ao criar PIX Mercado Pago:', err);
+    throw new Error('ERRO_MP');
   }
-  });
-
-  await pagamentos().insertOne({
-    chatId,
-    valor,
-    paymentId: res.id,
-    status: res.status,
-    criadoEm: new Date()
-  });
-
-  return {
-    id: res.id,
-    qrCode: res.point_of_interaction.transaction_data.qr_code,
-    qrCodeBase64: res.point_of_interaction.transaction_data.qr_code_base64
-  };
-} catch (err){
-  console.error('❌ Erro ao criar PIX Mercado Pago:', err);
-  throw new Error('ERRO_MP');
-}
 }
 
 
