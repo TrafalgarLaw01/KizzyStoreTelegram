@@ -6,7 +6,11 @@ const app = express();
 
 app.use(express.json());
 
-const bot = new TelegramBot(process.env.BOT_TOKEN);
+const bot = new TelegramBot(process.env.BOT_TOKEN, {
+  polling: true
+});
+
+console.log('BOT TELEGRAM ONLINE (polling ativo)');
 const mpClient = new MercadoPagoConfig({
   accessToken: process.env.MP_ACCESS_TOKEN
 });
@@ -19,7 +23,7 @@ app.get('/', (req, res) => {
 });
 
 app.post('/webhook/mercadopago', async (req, res) => {
-  console.log('Webhook recebido:', req.body);
+  console.log('Webhook  MP recebido:', req.body);
 
   //validação pagamento
   res.sendStatus(200);
