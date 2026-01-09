@@ -119,7 +119,7 @@ async function criarPix(chatId, valor) {
 }
 
   const res = await payment.create({
-    transaction_amount: Number(valor),
+    transaction_amount: Number(valor.toFixed(2)),
     description: 'Adicionar saldo - Kizzy Store',
     payment_method_id: 'pix',
     payer: {
@@ -143,7 +143,7 @@ async function criarPix(chatId, valor) {
   };
 } catch (err){
   console.error('❌ Erro ao criar PIX Mercado Pago:', err);
-  throw new Erro('ERRO_MP');
+  throw new Error('ERRO_MP');
 }
 }
 
@@ -451,7 +451,7 @@ if (valor < 3) {
 }
 
 
-    let pagamentos;
+    let pagamento;
 
     // cria pagamento PIX
     try {
