@@ -113,6 +113,7 @@ async function getPreco() {
 /* ================ CRIAR PIX ============== */
 
 async function criarPix(chatId, valor) {
+  try {
   const res = await payment.create({
     transaction_amount: Number(valor),
     description: 'Adicionar saldo - Kizzy Store',
@@ -136,6 +137,10 @@ async function criarPix(chatId, valor) {
     qrCode: res.point_of_interaction.transaction_data.qr_code,
     qrCodeBase64: res.point_of_interaction.transaction_data.qr_code_base64
   };
+} catch (err){
+  console.error('❌ Erro ao criar PIX Mercado Pago:', err);
+  throw new Erro('ERRO_MP');
+}
 }
 
 
@@ -439,9 +444,18 @@ bot.on('message', async msg => {
       return bot.sendMessage(chatId, '⚠️ O valor mínimo é R$ 3,00.');
     }
 
-    // cria pagamento PIX
-    const pagamento = await criarPix(chatId, valor);
+    let pagamentos;
 
+    // cria pagamento PIX
+    try {
+      pagamento = await criarPix(chatId, valor);
+    } catch (e) {
+      return bot.sendMessage(
+        chatId,
+        '❌ Erro ao gerar o PIX. Tente novamente em alguns instantes.'
+      );
+    }
+    
     await bot.sendMessage(
       chatId,
 `💳 *PIX GERADO COM SUCESSO*
