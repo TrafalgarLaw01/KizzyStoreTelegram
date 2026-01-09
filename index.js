@@ -71,9 +71,37 @@ async function startApp() {
 
   console.log('BOT TELEGRAM ONLINE (polling ativo)');
 
+/*============ resposta pagamento =========== */
+app.post('/webhook/mercadopago', async (req, res) => {
+  const paymentId = req.body.data?.id;
+  if (!paymentId) return res.sendStatus(200);
 
+  const mpData = await payment.get({ id: paymentId });
 
+  if (mpData.status === 'approved') {
+    const pag = await pagamentos().findOne({ paymentId });
 
+    if (pag && !pag.confirmado) {
+      await users().updateOne(
+        { chatId: pag.chatId },
+        { $inc: { saldo: pag.valor } }
+      );
+
+      await pagamentos().updateOne(
+        { paymentId },
+        { $set: { confirmado: true } }
+      );
+
+      bot.sendMessage(
+        pag.chatId,
+        `✅ *Pagamento confirmado!*\n\n💰 Saldo adicionado: R$ ${pag.valor.toFixed(2)}`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+  }
+
+  res.sendStatus(200);
+});
 
 /* ================= CONFIG PADRÃO ================= */
 
@@ -81,6 +109,35 @@ async function getPreco() {
   const cfg = await config().findOne({ key: 'preco' });
   return cfg ? cfg.valor : 0.70;
 }
+
+/* ================ CRIAR PIX ============== */
+
+async function criarPix(chatId, valor) {
+  const res = await payment.create({
+    transaction_amount: Number(valor),
+    description: 'Adicionar saldo - Kizzy Store',
+    payment_method_id: 'pix',
+    payer: {
+      email: `user${chatId}@kizzystore.com`
+    },
+    notification_url: `${process.env.BASE_URL}/webhook/mercadopago`
+  });
+
+  await pagamentos().insertOne({
+    chatId,
+    valor,
+    paymentId: res.id,
+    status: res.status,
+    criadoEm: new Date()
+  });
+
+  return {
+    id: res.id,
+    qrCode: res.point_of_interaction.transaction_data.qr_code,
+    qrCodeBase64: res.point_of_interaction.transaction_data.qr_code_base64
+  };
+}
+
 
 /* ================= USUÁRIO ================= */
 
@@ -159,16 +216,34 @@ bot.on('callback_query', async q => {
 
   /* VOLTAR */
   if (q.data === 'voltar_menu') {
-    await setEtapa(chatId, 'menu');
+    await users().updateOne(
+      { chatId },
+      {
+        $set: { etapa: 'menu' },
+        $unset: { msgCompraId: '' }
+      }
+    );
     const menu = menuPrincipal(user);
     return bot.sendMessage(chatId, menu.text, menu.opts);
   }
 
   /* COMPRAR */
   if (q.data === 'comprar') {
-    await setEtapa(chatId, 'comprar');
-    await users().updateOne({ chatId }, { $set: { quantidade: 1 } });
-    return atualizarTelaCompra(chatId);
+    await users().updateOne(
+      { chatId }, 
+      { 
+        $set: { etapa: 'comprar', quantidade: 1 },
+        $unset: { msgCompraId: '' }
+      }
+    );
+    const msg = await atualizarTelaCompra(chatId, true);
+await users().updateOne(
+  { chatId },
+  { $set: { msgCompraId: msg.message_id } }
+);
+
+return;
+
   }
 
   /* QUANTIDADE */
@@ -176,8 +251,15 @@ bot.on('callback_query', async q => {
     let qtd = user.quantidade;
     if (q.data === 'mais') qtd++;
     if (q.data === 'menos' && qtd > 1) qtd--;
-    await users().updateOne({ chatId }, { $set: { quantidade: qtd } });
-    return atualizarTelaCompra(chatId);
+    await users().updateOne(
+      { chatId }, 
+      { $set: { quantidade: qtd } }
+    );
+
+    await atualizarTelaCompra(chatId);
+
+    return;
+
   }
 
   /* CONFIRMAR COMPRA */
@@ -188,22 +270,22 @@ bot.on('callback_query', async q => {
 
 /* ================= TELA COMPRA ================= */
 
-async function atualizarTelaCompra(chatId) {
+async function atualizarTelaCompra(chatId, nova = false) {
   const user = await getUser(chatId);
   const preco = await getPreco();
   const estoqueQtd = await estoque().countDocuments({ vendida: false });
   const total = user.quantidade * preco;
 
-  bot.sendMessage(
-    chatId,
+  const texto =
 `📦 *Contas Outlook – Alta Qualidade*
 
 • 💵 Preço: R$ ${preco.toFixed(2)}
 • 📦 Quantidade: ${user.quantidade}
 • 🧮 Total: R$ ${total.toFixed(2)}
 • 💰 Seu saldo: R$ ${user.saldo.toFixed(2)}
-• 📊 Estoque: ${estoqueQtd}`,
-    {
+• 📊 Estoque: ${estoqueQtd}`;
+
+  const opts = {
       parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [
@@ -217,8 +299,20 @@ async function atualizarTelaCompra(chatId) {
           [{ text: '🆘 Suporte', url: process.env.SUPORTE_URL }]
         ]
       }
+    };
+
+    if (nova || !user.msgCompraId){
+      return bot.sendMessage(chatId, texto, opts);
     }
-  );
+    try {
+      return bot.editMessageText(texto, {
+        chat_id: chatId,
+        message_id: user.msgCompraId,
+        ...opts
+      });
+    } catch (err) {
+      return bot.sendMessage(chatId, texto, opts);
+    }
 }
 
 /* ================= CONFIRMAR COMPRA ================= */
@@ -245,7 +339,11 @@ async function confirmarCompra(chatId) {
 
   await users().updateOne(
     { chatId },
-    { $inc: { saldo: -total }, $set: { etapa: 'menu', quantidade: 1 } }
+    { 
+      $inc: { saldo: -total }, 
+      $set: { etapa: 'menu', quantidade: 1 },
+      $unset: { msgCompraId: '' }
+    }
   );
 
   await estoque().updateMany(
@@ -321,6 +419,52 @@ bot.onText(/\/preco (.+)/, async (msg, match) => {
 
   bot.sendMessage(msg.chat.id, `💲 Preço atualizado: R$ ${valor.toFixed(2)}`);
 });
+
+bot.on('message', async msg => {
+  // ignora comandos
+  if (!msg.text || msg.text.startsWith('/')) return;
+
+  const chatId = msg.chat.id;
+  const user = await getUser(chatId);
+
+  // ===== ADD SALDO =====
+  if (user.etapa === 'add_saldo') {
+    let valor = parseFloat(msg.text.replace(',', '.'));
+
+    if (isNaN(valor)) {
+      return bot.sendMessage(chatId, '❌ Digite um valor válido.');
+    }
+
+    if (valor < 3) {
+      return bot.sendMessage(chatId, '⚠️ O valor mínimo é R$ 3,00.');
+    }
+
+    // cria pagamento PIX
+    const pagamento = await criarPix(chatId, valor);
+
+    await bot.sendMessage(
+      chatId,
+`💳 *PIX GERADO COM SUCESSO*
+
+💰 Valor: R$ ${valor.toFixed(2)}
+
+📋 *Copia e cola:*
+\`${pagamento.qrCode}\``,
+      { parse_mode: 'Markdown' }
+    );
+
+    if (pagamento.qrCodeBase64) {
+      await bot.sendPhoto(
+        chatId,
+        Buffer.from(pagamento.qrCodeBase64, 'base64'),
+        { caption: '📲 Escaneie o QR Code para pagar' }
+      );
+    }
+
+    await setEtapa(chatId, 'menu');
+  }
+});
+
 
 /* ================= BROADCAST ================= */
 
