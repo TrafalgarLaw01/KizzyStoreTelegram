@@ -72,7 +72,7 @@ async function startApp() {
   console.log('BOT TELEGRAM ONLINE (polling ativo)');
 
 
-startApp();
+
 
 
 /* ================= CONFIG PADRÃO ================= */
