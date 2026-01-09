@@ -67,60 +67,31 @@ async function startApp() {
   console.log('BOT TELEGRAM ONLINE (polling ativo)');
 
 /*============ RESPOSTA PAGAMENTO (WEBHOOK ROBUSTO) =========== */
+/*============ RESPOSTA PAGAMENTO (FINAL) =========== */
 app.post('/webhook/mercadopago', async (req, res) => {
-  // 1. Responder OK imediatamente para o MP não ficar tentando de novo
   res.sendStatus(200);
 
   try {
-    // Log para ver o que chegou (Olhe isso nas logs da Render!)
-    console.log('🔔 Webhook recebido:', JSON.stringify(req.body, null, 2));
-
     const action = req.body.action;
-    const type = req.body.type;
-    
-    // O ID pode vir em data.id ou data.id (dependendo da versão da API)
-    // Vamos garantir que pegamos o ID certo
-    let paymentId = req.body.data?.id; 
+    const paymentId = req.body.data?.id;
 
-    // Se não tiver ID ou não for atualização de pagamento, ignora
-    if (!paymentId || (action !== 'payment.created' && action !== 'payment.updated')) {
-      console.log('⚠️ Webhook ignorado: Ação não é criação/atualização ou sem ID.');
-      return;
-    }
+    if (!paymentId || (action !== 'payment.created' && action !== 'payment.updated')) return;
 
-    // Converter para string e número para garantir a busca no banco
-    const idString = String(paymentId);
-    const idNumber = Number(paymentId);
-
-    console.log(`🔎 Buscando no banco pelo ID: ${idString} (ou ${idNumber})`);
-
-    // Busca no banco tentando os dois formatos (Texto ou Número)
+    // Busca inteligente (Texto ou Número)
     const pag = await pagamentos().findOne({
       $or: [
-        { paymentId: idString },
-        { paymentId: idNumber }
+        { paymentId: String(paymentId) },
+        { paymentId: Number(paymentId) }
       ]
     });
 
-    if (!pag) {
-      console.error('❌ Pagamento NÃO encontrado no Mongo. Verifique se o ID salvou corretamente na criação.');
-      return;
-    }
+    if (!pag || pag.confirmado) return;
 
-    console.log('✅ Pagamento encontrado no banco:', pag._id);
-
-    if (pag.confirmado) {
-      console.log('⚠️ Pagamento já estava confirmado. Ignorando.');
-      return;
-    }
-
-    // Consulta status atualizado na API do Mercado Pago
-    // Importante: Passar o ID como obtido no webhook
+    // Checa status no MP
     const mpData = await payment.get({ id: paymentId });
-    console.log('💰 Status no Mercado Pago:', mpData.status);
 
     if (mpData.status === 'approved') {
-      console.log('🚀 Pagamento APROVADO! Liberando saldo...');
+      console.log(`🚀 Pagamento ${paymentId} APROVADO!`);
 
       // 1. Atualiza Saldo
       await users().updateOne(
@@ -130,34 +101,43 @@ app.post('/webhook/mercadopago', async (req, res) => {
 
       // 2. Marca como confirmado
       await pagamentos().updateOne(
-        { _id: pag._id }, // Usa o _id do mongo para garantir
+        { _id: pag._id },
         { $set: { confirmado: true, confirmadoEm: new Date() } }
       );
 
-      // 3. Apaga msg QR Code
-      if (pag.msgPixId) {
+      // 3. APAGAR MENSAGENS (Texto e Foto)
+      const apagarMsg = async (msgId) => {
         try {
-          await bot.deleteMessage(pag.chatId, pag.msgPixId);
-          console.log('🗑️ Mensagem do QR Code apagada.');
+          await bot.deleteMessage(pag.chatId, msgId);
         } catch (err) {
-          console.log('⚠️ Não deu para apagar mensagem (talvez já apagada).');
+          // Ignora erro se mensagem já foi apagada ou muito antiga
         }
-      }
+      };
 
-      // 4. Avisa o usuário
+      if (pag.msgPixId) await apagarMsg(pag.msgPixId);   // Apaga o texto do copia e cola
+      if (pag.msgFotoId) await apagarMsg(pag.msgFotoId); // Apaga a foto do QR Code
+
+      // 4. MENSAGEM DE SUCESSO
       await bot.sendMessage(
         pag.chatId,
-        `✅ *Pagamento confirmado!*\n\n💰 + R$ ${pag.valor.toFixed(2)} adicionados ao seu saldo.`,
+        `✅ *Pagamento confirmado!*\n\n💰 + R$ ${pag.valor.toFixed(2)} foram adicionados.`,
         { parse_mode: 'Markdown' }
       );
+
+      // 5. REENVIAR MENU PRINCIPAL (Para não travar o bot)
+      // Buscamos o usuário atualizado para mostrar o saldo novo no menu
+      const userAtualizado = await users().findOne({ chatId: pag.chatId });
       
-      console.log('🏁 Processo finalizado com sucesso.');
-    } else {
-        console.log(`ℹ️ Pagamento ainda não aprovado. Status: ${mpData.status}`);
+      // Reutiliza sua função de menu existente
+      const menu = menuPrincipal(userAtualizado); 
+      
+      await bot.sendMessage(pag.chatId, menu.text, menu.opts);
+      
+      console.log('🏁 Menu reenviado com saldo atualizado.');
     }
 
   } catch (err) {
-    console.error('❌ ERRO CRÍTICO no Webhook:', err);
+    console.error('Erro Webhook:', err);
   }
 });
 
