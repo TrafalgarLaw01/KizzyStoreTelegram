@@ -2,8 +2,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { MongoClient, ServerApiVersion } = require('mongodb');
 const { MercadoPagoConfig, Payment } = require('mercadopago');
 const express = require('express');
-
-const app = express = require('express');
+const app = express();
 
 app.use(express.json());
 
@@ -28,7 +27,7 @@ app.post('/webhook/mercadopago', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`webhook reodando na porta ${PORT}`);
+  console.log(`webhook rodando na porta ${PORT}`);
 });
 
 
