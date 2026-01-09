@@ -1,10 +1,9 @@
-require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const { MongoClient } = require('mongodb');
 const mercadopago = require('mercadopago');
 const express = require('express');
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(process.env.BOT_TOKEN);
 mercadopago.configure({ access_token: process.env.MERCADOPAGO_TOKEN });
 
 /* ================= MONGO ================= */
