@@ -68,8 +68,12 @@ async function startApp() {
 
 /*============ resposta pagamento =========== */
 app.post('/webhook/mercadopago', async (req, res) => {
+  res.sendStatus(200);
+  try{
   const paymentId = req.body.data?.id;
-  if (!paymentId) return res.sendStatus(200);
+  const action = req.body.action;
+
+  if (!paymentId || (action !== 'payment.created' && action !== 'payment.updated')) return;
 
   const mpData = await payment.get({ id: paymentId });
 
@@ -84,19 +88,29 @@ app.post('/webhook/mercadopago', async (req, res) => {
 
       await pagamentos().updateOne(
         { paymentId },
-        { $set: { confirmado: true } }
+        { $set: { confirmado: true, confirmadoEm: new Date() } }
       );
+
+      if (pag.msgPixId) {
+        try {
+          await bot.deleteMessage(pag.chatId, pag.msgPixId);
+        } catch (err) {
+          console.log('Não foi possivel apagar a msg do pix (provavavelmente muito antiga ou ja apagada)');
+        }
+      }
 
       bot.sendMessage(
         pag.chatId,
-        `✅ *Pagamento confirmado!*\n\n💰 Saldo adicionado: R$ ${pag.valor.toFixed(2)}`,
-        { parse_mode: 'Markdown' }
+        `✅ *Pagamento confirmado!*\n\n💰 + R$ ${pag.valor.toFixed(2)} adicionados ao seu saldo.`,
+        { parse_mode: 'markdown' }
       );
     }
   }
-
-  res.sendStatus(200);
+} catch (err){
+  console.error('erro no processamento do webhook:', err);
+}
 });
+
 
 /* ================= CONFIG PADRÃO ================= */
 
@@ -438,7 +452,7 @@ bot.on('message', async msg => {
   if (user.etapa === 'add_saldo') {
     
     const texto = msg.text.trim().replace(',', '.');
-const valor = Number(texto);
+    const valor = Number(texto);
 
 if (!Number.isFinite(valor)) {
   return bot.sendMessage(chatId, '❌ Digite apenas números. Ex: 10 ou 5.50');
@@ -450,6 +464,7 @@ if (valor < 3) {
 
 
     let pagamento;
+    let msgPixEnviada;
 
     // cria pagamento PIX
     try {
@@ -460,29 +475,44 @@ if (valor < 3) {
         '❌ Erro ao gerar o PIX. Tente novamente em alguns instantes.'
       );
     }
-    
-    await bot.sendMessage(
+
+    msgPixEnviada = await bot.sendMessage(
       chatId,
-`💳 *PIX GERADO COM SUCESSO*
+      `💳 *PIX GERADO COM SUCESSO*
 
 💰 Valor: R$ ${valor.toFixed(2)}
+📋 *Copia e cola (clique abaixo para copiar):*
+\`${pagamento.qrCode}\`
 
-📋 *Copia e cola:*
-\`${pagamento.qrCode}\``,
+_⏳ Aguardando pagamento... Assim que confirmado, esta mensagem sumirá e o saldo cairá._`,
       { parse_mode: 'Markdown' }
     );
 
+    await pagamentos().updateOne(
+      { paymentId: pagamento.id },
+      { $set: { msgPixId: msgPixEnviada.message_id } }
+    );
+
     if (pagamento.qrCodeBase64) {
-      await bot.sendPhoto(
+      const msgFoto = await bot.sendPhoto(
         chatId,
         Buffer.from(pagamento.qrCodeBase64, 'base64'),
-        { caption: '📲 Escaneie o QR Code para pagar' }
+        { caption: '📲 Escaneie o QR Code acima' }
+      );
+
+      await pagamentos().updateOne(
+        { paymentId: pagamento.id },
+        { $set: { msgFotoId: msgFoto.message_id } }
       );
     }
 
     await setEtapa(chatId, 'menu');
   }
-});
+  });
+
+
+
+    
 
 
 /* ================= BROADCAST ================= */
