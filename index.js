@@ -114,6 +114,10 @@ async function getPreco() {
 
 async function criarPix(chatId, valor) {
   try {
+    if (!Number.isFinite(valor) || valor <= 0) {
+  throw new Error(`VALOR_INVALIDO_PIX: ${valor}`);
+}
+
   const res = await payment.create({
     transaction_amount: Number(valor),
     description: 'Adicionar saldo - Kizzy Store',
@@ -434,15 +438,18 @@ bot.on('message', async msg => {
 
   // ===== ADD SALDO =====
   if (user.etapa === 'add_saldo') {
-    let valor = parseFloat(msg.text.replace(',', '.'));
+    
+    const texto = msg.text.trim().replace(',', '.');
+const valor = Number(texto);
 
-    if (isNaN(valor)) {
-      return bot.sendMessage(chatId, '❌ Digite um valor válido.');
-    }
+if (!Number.isFinite(valor)) {
+  return bot.sendMessage(chatId, '❌ Digite apenas números. Ex: 10 ou 5.50');
+}
 
-    if (valor < 3) {
-      return bot.sendMessage(chatId, '⚠️ O valor mínimo é R$ 3,00.');
-    }
+if (valor < 3) {
+  return bot.sendMessage(chatId, '⚠️ O valor mínimo é R$ 3,00.');
+}
+
 
     let pagamentos;
 
