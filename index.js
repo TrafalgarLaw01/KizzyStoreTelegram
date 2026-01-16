@@ -11,6 +11,18 @@ const mpClient = new MercadoPagoConfig({
 
 const payment = new Payment(mpClient);
 
+// --- SISTEMA ANTI-CRASH ---
+process.on('unhandledRejection', (reason, promise) => {
+    console.log('⚠️ [Anti-Crash] Rejeição não tratada:', reason);
+    // O bot NÃO vai cair.
+});
+
+process.on('uncaughtException', (error) => {
+    console.log('❌ [Anti-Crash] Erro fatal:', error);
+    // O bot NÃO vai cair.
+});
+// ---------------------------
+
 /* ================ EXPRESS =============== */
 app.get('/', (req, res) => {
   res.send('Kizzy store Online');
@@ -68,6 +80,16 @@ async function startApp() {
   // 2. Bot depois
   const TelegramBot = require('node-telegram-bot-api');
   bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+
+  // --- COPIE AQUI (IGNORAR ERRO DE CONEXÃO) ---
+    bot.on('polling_error', (error) => {
+    // Se for erro de conexão resetada, apenas ignora
+    if (error.code === 'ECONNRESET' || error.message.includes('ECONNRESET')) {
+        return;
+    }
+    console.log(`⚠️ [Polling Error] ${error.code}: ${error.message}`);
+});
+// --------------------------------------------
 
   await bot.deleteWebHook({ drop_pending_updates: true });
 
@@ -434,6 +456,62 @@ async function confirmarCompra(chatId) {
   const menu = menuPrincipal(await getUser(chatId));
   bot.sendMessage(chatId, menu.text, menu.opts);
 }
+
+// --- COPIE AQUI (NOVOS COMANDOS) ---
+
+// COMANDO: Adicionar Saldo Manualmente
+// Uso: /addsaldo ID VALOR
+bot.onText(/\/addsaldo (.+)/, async (msg, match) => {
+    // Verifica se é admin usando sua função existente
+    if (!isAdmin(msg.chat.id)) return;
+    
+    const args = match[1].split(' '); 
+    const targetId = Number(args[0]); // ID do cliente
+    const valor = parseFloat(args[1]); // Valor a adicionar
+
+    if (!targetId || isNaN(valor)) {
+        return bot.sendMessage(msg.chat.id, "❌ Uso correto: `/addsaldo ID VALOR`\nEx: /addsaldo 123456789 10");
+    }
+
+    // Atualiza no banco
+    const res = await users().updateOne(
+        { chatId: targetId },
+        { $inc: { saldo: valor } }
+    );
+
+    if (res.matchedCount > 0) {
+        bot.sendMessage(msg.chat.id, `✅ R$ ${valor.toFixed(2)} adicionados para o ID ${targetId}`);
+        // Avisa o usuário (opcional, pode apagar a linha de baixo se não quiser)
+        bot.sendMessage(targetId, `🎁 Você recebeu R$ ${valor.toFixed(2)} de saldo extra!`).catch(() => {});
+    } else {
+        bot.sendMessage(msg.chat.id, "❌ Usuário não encontrado no banco de dados.");
+    }
+});
+
+// COMANDO: Avisar Todos (Manutenção/Novidades)
+// Uso: /avisar MENSAGEM
+bot.onText(/\/avisar (.+)/, async (msg, match) => {
+    if (!isAdmin(msg.chat.id)) return;
+
+    const mensagem = match[1];
+    bot.sendMessage(msg.chat.id, "📣 Enviando mensagem para todos...");
+
+    const allUsers = await users().find().toArray();
+    let count = 0;
+
+    for (const u of allUsers) {
+        try {
+            // Pequeno delay para não travar o bot
+            await new Promise(r => setTimeout(r, 50));
+            await bot.sendMessage(u.chatId, `📢 *AVISO IMPORTANTE*\n\n${mensagem}`, { parse_mode: 'Markdown' });
+            count++;
+        } catch (e) {
+            // Ignora quem bloqueou o bot
+        }
+    }
+    bot.sendMessage(msg.chat.id, `✅ Enviado para ${count} usuários.`);
+});
+// ----------------------------------
 
 /* ================= ADMIN ================= */
 
