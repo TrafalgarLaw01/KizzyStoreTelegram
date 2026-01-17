@@ -545,10 +545,23 @@ app.post('/webhook/mercadopago', async (req, res) => {
   res.sendStatus(200);
 
   try {
+
+    console.log('webhook recebido:', JSON.stringify(req.body));
+
     const action = req.body.action;
+    const type = req.body.type;
+
     const paymentIdRaw = req.body.data?.id;
+
     if (!paymentIdRaw) return;
-    if (action !== 'payment.created' && action !== 'payment.updated') return;
+    const ehPagamento = 
+      action === 'payment.created' ||
+      action === 'payment.update' ||
+      type === 'payment';
+
+    if (!ehPagamento) {
+      return;
+    }
 
     const paymentId = String(paymentIdRaw);
 
