@@ -11,15 +11,30 @@ const mpClient = new MercadoPagoConfig({
 
 const payment = new Payment(mpClient);
 
-// --- SISTEMA ANTI-CRASH ---
+
+// --- NOVO SISTEMA ANTI-CRASH SEGURO ---
+
 process.on('unhandledRejection', (reason, promise) => {
-    console.log('⚠️ [Anti-Crash] Rejeição não tratada:', reason);
-    // O bot NÃO vai cair.
+    // Se o erro for de conexão ou "message not modified", ignoramos o log exagerado
+    if (reason?.message?.includes('message is not modified')) return;
+    if (reason?.code === 'ECONNRESET') {
+        console.log('⚠️ [Anti-Crash] Instabilidade de Rede (ECONNRESET) detectada e tratada.');
+        return;
+    }
+
+    // Para outros erros, mostramos apenas a mensagem e o stack (sem o objeto completo que contém tokens)
+    console.error('⚠️ [Anti-Crash] Erro não tratado:', reason.message || reason);
+    // Opcional: descomente a linha abaixo se precisar ver onde foi o erro, mas cuidado com logs públicos
+    // console.error(reason.stack);
 });
 
-process.on('uncaughtException', (error) => {
-    console.log('❌ [Anti-Crash] Erro fatal:', error);
-    // O bot NÃO vai cair.
+process.on('uncaughtException', (error, origin) => {
+    console.error(`⚠️ [Anti-Crash] Erro Crítico: ${error.message}`);
+    // console.error(error.stack);
+});
+
+process.on('uncaughtExceptionMonitor', (error, origin) => {
+    console.error(`⚠️ [Anti-Crash] Monitor: ${error.message}`);
 });
 // ---------------------------
 
@@ -55,6 +70,12 @@ const mongoClient = new MongoClient(uri || "mongodb://erro_configuracao_painel",
 let db;
 let bot;
 
+async function criarIndices() {
+    await users().createIndex({ chatId: 1 }, { unique: true });
+    await pagamentos().createIndex({ paymentId: 1 }, { unique: true }); // Evita duplicidade no banco
+    await estoque().createIndex({ vendida: 1 }); // Acelera a busca de estoque
+}
+
 async function startMongo() {
   try {
   await mongoClient.connect();
@@ -73,9 +94,129 @@ const estoque = () => db.collection('estoque');
 const pagamentos = () => db.collection('pagamentos');
 const config = () => db.collection('config');
 
+const delay = ms => new Promise(res => setTimeout(res, ms));
+
+async function enviarMensagemComRetry(chatId, texto, opcoes = {}, tentativas = 5) {
+  for (let i = 0; i < tentativas; i++) {
+    try {
+      return await bot.sendMessage(chatId, texto, opcoes);
+    } catch (erro) {
+      const msg = erro?.message || '';
+      const code = erro?.code;
+
+      // ✅ Telegram 429: Too Many Requests (rate limit)
+      // node-telegram-bot-api costuma trazer retry_after aqui:
+      const retryAfter =
+        erro?.response?.body?.parameters?.retry_after ??
+        erro?.response?.body?.retry_after;
+
+      if (Number.isFinite(retryAfter)) {
+        const esperaMs = (retryAfter * 1000) + 250; // + folga de 250ms
+        console.log(`⏳ [Retry 429] Rate limit. Esperando ${esperaMs}ms e tentando novamente (${i + 1}/${tentativas})...`);
+        await delay(esperaMs);
+        continue;
+      }
+
+      // ✅ Erros de rede comuns (instabilidade)
+      const isNetworkError =
+        code === 'ECONNRESET' ||
+        code === 'ETIMEDOUT' ||
+        code === 'EAI_AGAIN' ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('ETIMEDOUT');
+
+      // ✅ Erros de usuário (bloqueou o bot / chat inválido)
+      // Telegram costuma responder 403/400 nesses casos
+      const httpStatus = erro?.response?.statusCode || erro?.response?.status;
+      const isUserError = httpStatus === 403 || httpStatus === 400;
+
+      if (isUserError) {
+        // não adianta tentar novamente
+        throw erro;
+      }
+
+      // Última tentativa: joga erro
+      if (i === tentativas - 1) {
+        console.error(`❌ Falha definitiva ao enviar para ${chatId}:`, msg);
+        throw erro;
+      }
+
+      // Backoff progressivo (mais leve no começo)
+      const backoffMs = 800 + (i * 700);
+
+      if (isNetworkError) {
+        console.log(`⚠️ Oscilação de rede. Backoff ${backoffMs}ms (${i + 1}/${tentativas})...`);
+        await delay(backoffMs);
+        continue;
+      }
+
+      // Outros erros transitórios (ex.: Telegram instável)
+      console.log(`⚠️ Erro ao enviar msg (${i + 1}/${tentativas}): ${msg}. Tentando novamente em ${backoffMs}ms...`);
+      await delay(backoffMs);
+    }
+  }
+}
+
+// Função que roda a cada 60 segundos para limpar PIX velho
+function iniciarVerificacaoPix() {
+  setInterval(async () => {
+    try {
+      // Define o tempo limite (ex: 10 minutos atrás)
+      const tempoLimite = new Date(Date.now() - 10 * 60 * 1000); 
+
+      // Busca pagamentos que:
+      // 1. Estão com status 'created' (não pagos)
+      // 2. Foram criados ANTES do tempo limite
+      // 3. Ainda não foram cancelados no nosso banco
+      const expirados = await pagamentos().find({
+        status: 'created',
+        confirmado: false,
+        criadoEm: { $lt: tempoLimite },
+        cancelado: { $ne: true } // evita processar o mesmo várias vezes
+      }).toArray();
+
+      if (expirados.length === 0) return;
+
+      console.log(`🧹 Limpando ${expirados.length} PIX expirados...`);
+
+      for (const pag of expirados) {
+        // 1. Marca como cancelado no banco para não pegar de novo
+        await pagamentos().updateOne(
+          { _id: pag._id },
+          { $set: { cancelado: true, status: 'expired' } }
+        );
+
+        // 2. Apaga as mensagens do Telegram (QR Code e Texto)
+        // Usamos try/catch caso o usuário já tenha apagado a msg
+        if (pag.msgPixId) {
+          try { await bot.deleteMessage(pag.chatId, pag.msgPixId); } catch(e){}
+        }
+        if (pag.msgFotoId) {
+          try { await bot.deleteMessage(pag.chatId, pag.msgFotoId); } catch(e){}
+        }
+
+        // 3. Avisa o usuário que expirou
+        try {
+          await bot.sendMessage(pag.chatId, '⚠️ *O tempo para pagamento do PIX expirou.* \nGeramos um novo se você quiser adicionar saldo.', { parse_mode: 'Markdown' });
+          
+          // 4. (Opcional) Reseta a etapa do usuário para 'menu'
+          await setEtapa(pag.chatId, 'menu');
+        } catch (e) {
+          // Usuário pode ter bloqueado o bot
+        }
+      }
+
+    } catch (error) {
+      console.error('Erro no limpador de PIX:', error);
+    }
+  }, 60 * 1000); // Roda a cada 60 segundos
+}
+
+
 async function startApp() {
   // 1. Mongo primeiro
   await startMongo();
+  await criarIndices();
 
   // 2. Bot depois
   const TelegramBot = require('node-telegram-bot-api');
@@ -88,198 +229,24 @@ async function startApp() {
         return;
     }
     console.log(`⚠️ [Polling Error] ${error.code}: ${error.message}`);
+
+  
 });
+
+
 // --------------------------------------------
 
-  await bot.deleteWebHook({ drop_pending_updates: true });
+  try { await bot.deleteWebhook({ drop_pending_updates: true }); } catch(e){}
+
+  iniciarVerificacaoPix();
 
   console.log('BOT TELEGRAM ONLINE (polling ativo)');
 
-/*============ RESPOSTA PAGAMENTO (WEBHOOK ROBUSTO) =========== */
-/*============ RESPOSTA PAGAMENTO (FINAL) =========== */
-app.post('/webhook/mercadopago', async (req, res) => {
-  res.sendStatus(200);
-
-  try {
-    const action = req.body.action;
-    const paymentId = req.body.data?.id;
-
-    if (!paymentId || (action !== 'payment.created' && action !== 'payment.updated')) return;
-
-    // Busca inteligente (Texto ou Número)
-    const pag = await pagamentos().findOne({
-      $or: [
-        { paymentId: String(paymentId) },
-        { paymentId: Number(paymentId) }
-      ]
-    });
-
-    if (!pag || pag.confirmado) return;
-
-    // Checa status no MP
-    const mpData = await payment.get({ id: paymentId });
-
-    if (mpData.status === 'approved') {
-      console.log(`🚀 Pagamento ${paymentId} APROVADO!`);
-
-      // 1. Atualiza Saldo
-      await users().updateOne(
-        { chatId: pag.chatId },
-        { $inc: { saldo: pag.valor } }
-      );
-
-      // 2. Marca como confirmado
-      await pagamentos().updateOne(
-        { _id: pag._id },
-        { $set: { confirmado: true, confirmadoEm: new Date() } }
-      );
-
-      // 3. APAGAR MENSAGENS (Texto e Foto)
-      const apagarMsg = async (msgId) => {
-        try {
-          await bot.deleteMessage(pag.chatId, msgId);
-        } catch (err) {
-          // Ignora erro se mensagem já foi apagada ou muito antiga
-        }
-      };
-
-      if (pag.msgPixId) await apagarMsg(pag.msgPixId);   // Apaga o texto do copia e cola
-      if (pag.msgFotoId) await apagarMsg(pag.msgFotoId); // Apaga a foto do QR Code
-
-      // 4. MENSAGEM DE SUCESSO
-      await bot.sendMessage(
-        pag.chatId,
-        `✅ *Pagamento confirmado!*\n\n💰 + R$ ${pag.valor.toFixed(2)} foram adicionados.`,
-        { parse_mode: 'Markdown' }
-      );
-
-      // 5. REENVIAR MENU PRINCIPAL (Para não travar o bot)
-      // Buscamos o usuário atualizado para mostrar o saldo novo no menu
-      const userAtualizado = await users().findOne({ chatId: pag.chatId });
-      
-      // Reutiliza sua função de menu existente
-      const menu = menuPrincipal(userAtualizado); 
-      
-      await bot.sendMessage(pag.chatId, menu.text, menu.opts);
-      
-      console.log('🏁 Menu reenviado com saldo atualizado.');
-    }
-
-  } catch (err) {
-    console.error('Erro Webhook:', err);
-  }
-});
-
-
-/* ================= CONFIG PADRÃO ================= */
-
-async function getPreco() {
-  const cfg = await config().findOne({ key: 'preco' });
-  return cfg ? cfg.valor : 0.70;
+  registrarHandlers();
 }
 
-/* ================ CRIAR PIX (CORRIGIDO) ============== */
-
-async function criarPix(chatId, valor) {
-  try {
-    if (!Number.isFinite(valor) || valor <= 0) {
-      throw new Error(`VALOR_INVALIDO_PIX: ${valor}`);
-    }
-
-    // 1. Cria a preferência no Mercado Pago
-    const res = await payment.create({
-      body: {
-        transaction_amount: Number(valor.toFixed(2)),
-        description: 'Adicionar saldo - Kizzy Store',
-        payment_method_id: 'pix',
-        payer: {
-          email: `user${chatId}@kizzystore.com`
-        },
-        notification_url: `${process.env.BASE_URL}/webhook/mercadopago`
-      }
-    });
-
-    // LOG DE DEBUG: Vamos ver o que o Mercado Pago devolveu
-    console.log('RESPOSTA CRIAÇÃO MP:', JSON.stringify(res, null, 2));
-
-    // 2. Extrai o ID com segurança (algumas versões retornam em .id, outras em .body.id)
-    const idPagamentoMP = res.id || res.body?.id; // Tenta pegar de todo jeito
-
-    if (!idPagamentoMP) {
-      throw new Error('O Mercado Pago não retornou um ID de pagamento!');
-    }
-
-    console.log(`✅ ID do Pagamento capturado: ${idPagamentoMP}`);
-
-    // 3. Salva a "PONTE" no MongoDB
-    await pagamentos().insertOne({
-      chatId: chatId,          // <--- Quem comprou (Telegram)
-      paymentId: idPagamentoMP, // <--- O número do recibo (Mercado Pago)
-      valor: valor,
-      status: res.status,
-      confirmado: false,       // Começa falso
-      criadoEm: new Date()
-    });
-
-    return {
-      id: idPagamentoMP,
-      qrCode: res.point_of_interaction.transaction_data.qr_code,
-      qrCodeBase64: res.point_of_interaction.transaction_data.qr_code_base64
-    };
-
-  } catch (err) {
-    console.error('❌ Erro ao criar PIX Mercado Pago:', err);
-    throw new Error('ERRO_MP');
-  }
-}
-
-
-/* ================= USUÁRIO ================= */
-
-async function getUser(chatId) {
-  let user = await users().findOne({ chatId });
-  if (!user) {
-    user = {
-      chatId,
-      saldo: 0,
-      etapa: 'menu',
-      quantidade: 1
-    };
-    await users().insertOne(user);
-  }
-  return user;
-}
-
-async function setEtapa(chatId, etapa) {
-  await users().updateOne({ chatId }, { $set: { etapa } });
-}
-
-/* ================= MENUS ================= */
-
-function menuPrincipal(user) {
-  return {
-    text:
-`🛒 *Bem-vindo à Kizzy Store*
-
-• 👤 ID: ${user.chatId}
-• 💰 Saldo: R$ ${user.saldo.toFixed(2)}`,
-    opts: {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '💳 Adicionar saldo', callback_data: 'add_saldo' }],
-          [{ text: '🛍 Comprar contas', callback_data: 'comprar' }],
-          [{ text: '🆘 Suporte', url: process.env.SUPORTE_URL }]
-        ]
-      }
-    }
-  };
-}
-
-
-/* ================= START ================= */
-
-bot.onText(/\/start/, async msg => {
+function registrarHandlers(){
+  bot.onText(/\/start/, async msg => {
   const user = await getUser(msg.chat.id);
   await setEtapa(msg.chat.id, 'menu');
   const menu = menuPrincipal(user);
@@ -363,104 +330,6 @@ return;
   }
 });
 
-/* ================= TELA COMPRA ================= */
-
-async function atualizarTelaCompra(chatId, nova = false) {
-  const user = await getUser(chatId);
-  const preco = await getPreco();
-  const estoqueQtd = await estoque().countDocuments({ vendida: false });
-  const total = user.quantidade * preco;
-
-  const texto =
-`📦 *Contas Outlook – Alta Qualidade*
-
-• 💵 Preço: R$ ${preco.toFixed(2)}
-• 📦 Quantidade: ${user.quantidade}
-• 🧮 Total: R$ ${total.toFixed(2)}
-• 💰 Seu saldo: R$ ${user.saldo.toFixed(2)}
-• 📊 Estoque: ${estoqueQtd}`;
-
-  const opts = {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: '➖', callback_data: 'menos' },
-            { text: `${user.quantidade}`, callback_data: 'noop' },
-            { text: '➕', callback_data: 'mais' }
-          ],
-          [{ text: '✅ Comprar', callback_data: 'confirmar_compra' }],
-          [{ text: '⬅️ Voltar', callback_data: 'voltar_menu' }],
-          [{ text: '🆘 Suporte', url: process.env.SUPORTE_URL }]
-        ]
-      }
-    };
-
-    if (nova || !user.msgCompraId){
-      return bot.sendMessage(chatId, texto, opts);
-    }
-    try {
-      return bot.editMessageText(texto, {
-        chat_id: chatId,
-        message_id: user.msgCompraId,
-        ...opts
-      });
-    } catch (err) {
-      return bot.sendMessage(chatId, texto, opts);
-    }
-}
-
-/* ================= CONFIRMAR COMPRA ================= */
-
-async function confirmarCompra(chatId) {
-  const user = await getUser(chatId);
-  const preco = await getPreco();
-  const total = user.quantidade * preco;
-
-  if (user.saldo < total) {
-    return bot.sendMessage(chatId, '❌ Saldo insuficiente.');
-  }
-
-  const contas = await estoque()
-    .find({ vendida: false })
-    .limit(user.quantidade)
-    .toArray();
-
-  if (contas.length < user.quantidade) {
-    return bot.sendMessage(chatId, '❌ Estoque insuficiente.');
-  }
-
-  const ids = contas.map(c => c._id);
-
-  await users().updateOne(
-    { chatId },
-    { 
-      $inc: { saldo: -total }, 
-      $set: { etapa: 'menu', quantidade: 1 },
-      $unset: { msgCompraId: '' }
-    }
-  );
-
-  await estoque().updateMany(
-    { _id: { $in: ids } },
-    { $set: { vendida: true, vendidaEm: new Date() } }
-  );
-
-  let entrega = '✅ *Compra realizada!*\n\n';
-  contas.forEach(c => {
-    entrega += `${c.login}:${c.senha}\n`;
-  });
-
-  await bot.sendMessage(chatId, entrega, { parse_mode: 'Markdown' });
-
-  const menu = menuPrincipal(await getUser(chatId));
-  bot.sendMessage(chatId, menu.text, menu.opts);
-}
-
-// --- COPIE AQUI (NOVOS COMANDOS) ---
-
-// COMANDO: Adicionar Saldo Manualmente
-// Uso: /addsaldo ID VALOR
 bot.onText(/\/addsaldo (.+)/, async (msg, match) => {
     // Verifica se é admin usando sua função existente
     if (!isAdmin(msg.chat.id)) return;
@@ -481,8 +350,8 @@ bot.onText(/\/addsaldo (.+)/, async (msg, match) => {
 
     if (res.matchedCount > 0) {
         bot.sendMessage(msg.chat.id, `✅ R$ ${valor.toFixed(2)} adicionados para o ID ${targetId}`);
-        // Avisa o usuário (opcional, pode apagar a linha de baixo se não quiser)
-        bot.sendMessage(targetId, `🎁 Você recebeu R$ ${valor.toFixed(2)} de saldo extra!`).catch(() => {});
+        
+        enviarMensagemComRetry(targetId, `🎁 Você recebeu R$ ${valor.toFixed(2)} de bônus!`).catch(()=>{});
     } else {
         bot.sendMessage(msg.chat.id, "❌ Usuário não encontrado no banco de dados.");
     }
@@ -502,7 +371,7 @@ bot.onText(/\/avisar (.+)/, async (msg, match) => {
     for (const u of allUsers) {
         try {
             // Pequeno delay para não travar o bot
-            await new Promise(r => setTimeout(r, 50));
+            await new Promise(r => setTimeout(r, 300));
             await bot.sendMessage(u.chatId, `📢 *AVISO IMPORTANTE*\n\n${mensagem}`, { parse_mode: 'Markdown' });
             count++;
         } catch (e) {
@@ -511,13 +380,34 @@ bot.onText(/\/avisar (.+)/, async (msg, match) => {
     }
     bot.sendMessage(msg.chat.id, `✅ Enviado para ${count} usuários.`);
 });
-// ----------------------------------
 
-/* ================= ADMIN ================= */
+bot.onText(/\/estoque/, async (msg) => {
+  // 1. Segurança: Só admin pode ver
+  if (!isAdmin(msg.chat.id)) return;
 
-function isAdmin(id) {
-  return id.toString() === process.env.ADMIN_ID;
-}
+  try {
+    // 2. Conta rapidinho no banco
+    const disponiveis = await estoque().countDocuments({ vendida: false });
+    const vendidas = await estoque().countDocuments({ vendida: true });
+    const total = disponiveis + vendidas;
+
+    // 3. Mostra o relatório
+    const resposta = 
+`📊 *Relatório de Estoque*
+
+✅ *Disponíveis:* ${disponiveis}
+❌ *Vendidas:* ${vendidas}
+📦 *Total cadastrado:* ${total}
+
+${disponiveis === 0 ? '⚠️ *ATENÇÃO: ESTOQUE ZERADO!*' : ''}`;
+
+    bot.sendMessage(msg.chat.id, resposta, { parse_mode: 'Markdown' });
+
+  } catch (err) {
+    bot.sendMessage(msg.chat.id, 'Erro ao consultar estoque.');
+    console.error(err);
+  }
+});
 
 bot.onText(/\/addconta/, async msg => {
   if (!isAdmin(msg.chat.id)) return bot.sendMessage(msg.chat.id, '❌ Sem permissão.');
@@ -534,6 +424,7 @@ Envie as contas no próximo envio.`,
   );
 
   bot.once('message', async m => {
+    if (!isAdmin(m.chat.id)) return;
     const linhas = m.text.split('\n');
     const docs = linhas
       .filter(l => l.includes(':'))
@@ -640,6 +531,356 @@ _⏳ Aguardando pagamento... Assim que confirmado, esta mensagem sumirá e o sal
   }
   });
 
+}
+/*============FIM HANDLERS =================*/
+
+/*============ RESPOSTA PAGAMENTO (FINAL) =========== */
+app.post('/webhook/mercadopago', async (req, res) => {
+  res.sendStatus(200);
+
+  try {
+    const action = req.body.action;
+    const paymentIdRaw = req.body.data?.id;
+    if (!paymentIdRaw) return;
+    if (action !== 'payment.created' && action !== 'payment.updated') return;
+
+    const paymentId = String(paymentIdRaw);
+
+    // 1) Confere no banco se existe (evita spam)
+    const existe = await pagamentos().findOne({ paymentId }, { projection: { _id: 1 } });
+    if (!existe) return;
+
+    // 2) Consulta MP (status real)
+    const mpRes = await payment.get({ id: paymentIdRaw });
+    const mpData = mpRes?.body ?? mpRes;
+
+    if (mpData?.status !== 'approved') return;
+
+    // 3) TRAVA idempotente: só um request consegue confirmar
+    const locked = await pagamentos().findOneAndUpdate(
+      { paymentId, confirmado: false },
+      { $set: { confirmado: true, confirmadoEm: new Date(), mpStatus: mpData.status } },
+      { returnDocument: 'after' }
+    );
+
+    if (!locked.value) return; // já processado
+
+    const pag = locked.value;
+
+    // 4) Valida valor (evita inconsistência)
+    const valorPago = Number(mpData.transaction_amount);
+    if (!Number.isFinite(valorPago) || Number(valorPago.toFixed(2)) !== Number(pag.valor.toFixed(2))) {
+      console.error('⚠️ Valor divergente no pagamento', {
+        paymentId,
+        esperado: pag.valor,
+        recebido: mpData.transaction_amount
+      });
+      return;
+    }
+
+    console.log(`🚀 Pagamento ${paymentId} APROVADO! (+R$ ${pag.valor.toFixed(2)})`);
+
+    // 5) Credita saldo
+    await users().updateOne({ chatId: pag.chatId }, { $inc: { saldo: pag.valor } });
+
+    // 6) Apaga mensagens (best-effort)
+    const apagarMsg = async (msgId) => {
+      if (!msgId) return;
+      try { await bot.deleteMessage(pag.chatId, msgId); } catch (e) {}
+    };
+    await apagarMsg(pag.msgPixId);
+    await apagarMsg(pag.msgFotoId);
+
+    // 7) Confirma pro usuário
+    try {
+      await enviarMensagemComRetry(
+        pag.chatId,
+        `✅ *Pagamento confirmado!*\n\n💰 + R$ ${pag.valor.toFixed(2)} foram adicionados.`,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (e) {
+      console.error(`Erro ao avisar pagamento confirmado para ${pag.chatId}:`, e?.message || e);
+    }
+
+    // 8) Reenvia menu
+    const userAtualizado = await users().findOne({ chatId: pag.chatId });
+    const menu = menuPrincipal(userAtualizado);
+    await enviarMensagemComRetry(pag.chatId, menu.text, menu.opts);
+
+  } catch (err) {
+    console.error('Erro Webhook:', err?.message || err);
+  }
+});
+
+
+
+/* ================= CONFIG PADRÃO ================= */
+
+async function getPreco() {
+  const cfg = await config().findOne({ key: 'preco' });
+  return cfg ? cfg.valor : 0.70;
+}
+
+/* ================ CRIAR PIX (CORRIGIDO) ============== */
+
+async function criarPix(chatId, valor) {
+  try {
+    if (!Number.isFinite(valor) || valor <= 0) {
+      throw new Error(`VALOR_INVALIDO_PIX: ${valor}`);
+    }
+
+    const valorFix = Number(valor.toFixed(2));
+
+    const res = await payment.create({
+      body: {
+        transaction_amount: valorFix,
+        description: 'Adicionar saldo - Kizzy Store',
+        payment_method_id: 'pix',
+        payer: { email: `user${chatId}@kizzystore.com` },
+
+        // ajuda na validação e rastreio
+        external_reference: String(chatId),
+        metadata: { chatId, purpose: 'saldo', expectedValue: valorFix },
+
+        notification_url: `${process.env.BASE_URL}/webhook/mercadopago`
+      }
+    });
+
+    const data = res?.body ?? res;
+    const paymentId = data?.id;
+    const td = data?.point_of_interaction?.transaction_data;
+
+    if (!paymentId) throw new Error('MP não retornou ID de pagamento');
+    if (!td?.qr_code) throw new Error('MP não retornou qr_code');
+
+    // salva no banco
+    await pagamentos().insertOne({
+      chatId,
+      paymentId: String(paymentId),
+      valor: valorFix,
+      status: data?.status ?? 'created',
+      confirmado: false,
+      criadoEm: new Date()
+    });
+
+    console.log(`✅ PIX criado. paymentId=${paymentId} valor=R$${valorFix}`);
+
+    return {
+      id: String(paymentId),
+      qrCode: td.qr_code,
+      qrCodeBase64: td.qr_code_base64 || null
+    };
+
+  } catch (err) {
+    console.error('❌ Erro ao criar PIX Mercado Pago:', err?.message || err);
+    throw new Error('ERRO_MP');
+  }
+}
+
+
+
+/* ================= USUÁRIO ================= */
+
+async function getUser(chatId) {
+  let user = await users().findOne({ chatId });
+  if (!user) {
+    user = {
+      chatId,
+      saldo: 0,
+      etapa: 'menu',
+      quantidade: 1
+    };
+    await users().insertOne(user);
+  }
+  return user;
+}
+
+async function setEtapa(chatId, etapa) {
+  await users().updateOne({ chatId }, { $set: { etapa } });
+}
+
+/* ================= MENUS ================= */
+
+function menuPrincipal(user) {
+  return {
+    text:
+`🛒 *Bem-vindo à Kizzy Store*
+
+• 👤 ID: ${user.chatId}
+• 💰 Saldo: R$ ${user.saldo.toFixed(2)}`,
+    opts: {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '💳 Adicionar saldo', callback_data: 'add_saldo' }],
+          [{ text: '🛍 Comprar contas', callback_data: 'comprar' }],
+          [{ text: '🆘 Suporte', url: process.env.SUPORTE_URL }]
+        ]
+      }
+    }
+  };
+}
+
+
+/* ================= TELA COMPRA ================= */
+
+async function atualizarTelaCompra(chatId, nova = false) {
+  const user = await getUser(chatId);
+  const preco = await getPreco();
+  const estoqueQtd = await estoque().countDocuments({ vendida: false });
+  const total = user.quantidade * preco;
+
+  const texto = 
+`📦 *Contas Outlook – Alta Qualidade*
+
+• 💵 Preço: R$ ${preco.toFixed(2)}
+• 📦 Quantidade: ${user.quantidade}
+• 🧮 Total: R$ ${total.toFixed(2)}
+• 💰 Seu saldo: R$ ${user.saldo.toFixed(2)}
+• 📊 Estoque: ${estoqueQtd}`;
+
+
+  const opts = {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '➖', callback_data: 'menos' },
+            { text: `${user.quantidade}`, callback_data: 'noop' },
+            { text: '➕', callback_data: 'mais' }
+          ],
+          [{ text: '✅ Comprar', callback_data: 'confirmar_compra' }],
+          [{ text: '⬅️ Voltar', callback_data: 'voltar_menu' }],
+          [{ text: '🆘 Suporte', url: process.env.SUPORTE_URL }]
+        ]
+      }
+    };
+
+    if (nova || !user.msgCompraId){
+      return bot.sendMessage(chatId, texto, opts);
+    }
+    try {
+      return await bot.editMessageText(texto, {
+        chat_id: chatId,
+        message_id: user.msgCompraId,
+        ...opts
+      });
+    } catch (err) {
+      if (err.message && err.message.includes('message is not modified')) return;
+      return bot.sendMessage(chatId, texto, opts);
+    }
+}
+
+
+/* ================= CONFIRMAR COMPRA (SEGURA) ================= */
+async function confirmarCompra(chatId) {
+  const user = await getUser(chatId);
+  const preco = await getPreco();
+  const totalPrevisto = Number((user.quantidade * preco).toFixed(2));
+
+  // 1) Debita saldo primeiro, mas SÓ se tiver saldo suficiente (atômico)
+  const debit = await users().findOneAndUpdate(
+    { chatId, saldo: { $gte: totalPrevisto } },
+    {
+      $inc: { saldo: -totalPrevisto },
+      $set: { etapa: 'menu', quantidade: 1 },
+      $unset: { msgCompraId: '' }
+    },
+    { returnDocument: 'after' }
+  );
+
+  if (!debit.value) {
+    return bot.sendMessage(chatId, '❌ Saldo insuficiente.');
+  }
+
+  // 2) Agora tenta pegar as contas (atômico por item)
+  const contasParaEntregar = [];
+  try {
+    for (let i = 0; i < user.quantidade; i++) {
+      const item = await estoque().findOneAndUpdate(
+        { vendida: false },
+        { $set: { vendida: true, vendidaEm: new Date(), compradorId: chatId } },
+        { returnDocument: 'after' }
+      );
+
+      const doc = item?.value ?? item; // dependendo da versão do driver
+      if (doc && doc.login) {
+        contasParaEntregar.push(doc);
+      } else {
+        break;
+      }
+    }
+
+    // 3) Se faltou estoque no meio, desfaz tudo + estorna saldo
+    if (contasParaEntregar.length < user.quantidade) {
+      // desfaz vendas parciais
+      if (contasParaEntregar.length > 0) {
+        const ids = contasParaEntregar.map(c => c._id);
+        await estoque().updateMany(
+          { _id: { $in: ids } },
+          { $set: { vendida: false }, $unset: { vendidaEm: "", compradorId: "" } }
+        );
+      }
+
+      // estorna saldo
+      await users().updateOne(
+        { chatId },
+        { $inc: { saldo: totalPrevisto } }
+      );
+
+      return bot.sendMessage(chatId, '❌ Estoque insuficiente no momento da transação. Seu saldo foi estornado.');
+    }
+
+    // 4) Entrega
+    let entrega = '✅ *Compra realizada com sucesso!*\n\n⬇️ *Suas contas:*\n\n';
+    contasParaEntregar.forEach(c => {
+      entrega += `📧 \`${c.login}:${c.senha}\`\n`;
+    });
+
+    try {
+      await enviarMensagemComRetry(chatId, entrega, { parse_mode: 'Markdown' });
+    } catch (e) {
+      console.error(`🚨 Usuário ${chatId} comprou mas falhou envio. Dados estão no banco.`);
+      // aqui seria bom notificar admin
+    }
+
+    const userAtualizado = await getUser(chatId);
+    const menu = menuPrincipal(userAtualizado);
+    return bot.sendMessage(chatId, menu.text, menu.opts);
+
+  } catch (err) {
+    // se deu erro inesperado depois do débito, tenta estornar e desfazer qualquer coisa
+    console.error('Erro confirmarCompra:', err?.message || err);
+
+    if (contasParaEntregar.length > 0) {
+      const ids = contasParaEntregar.map(c => c._id);
+      await estoque().updateMany(
+        { _id: { $in: ids } },
+        { $set: { vendida: false }, $unset: { vendidaEm: "", compradorId: "" } }
+      );
+    }
+
+    await users().updateOne({ chatId }, { $inc: { saldo: totalPrevisto } });
+
+    return bot.sendMessage(chatId, '❌ Ocorreu um erro na compra. Seu saldo foi estornado. Tente novamente.');
+  }
+}
+
+
+
+// COMANDO: Adicionar Saldo Manualmente
+// Uso: /addsaldo ID VALOR
+
+// ----------------------------------
+
+/* ================= ADMIN ================= */
+
+function isAdmin(id) {
+  return id.toString() === process.env.ADMIN_ID;
+}
+
+
+
 
 
     
@@ -650,20 +891,25 @@ _⏳ Aguardando pagamento... Assim que confirmado, esta mensagem sumirá e o sal
 async function broadcast() {
   const all = await users().find().toArray();
   for (const u of all) {
-    bot.sendMessage(
+    try {
+      await delay(300);
+      await enviarMensagemComRetry(
       u.chatId,
-      '📦 Estoque abastecido!',
+      '📦 *Novo Estoque Disponível!*',
       {
+        parse_mode: 'markdown',
         reply_markup: {
           inline_keyboard: [
+            [{ text: '🛍 Comprar Agora', callback_data: 'comprar' }],
             [{ text: '🆘 Suporte', url: process.env.SUPORTE_URL }]
           ]
         }
       }
     );
+  } catch (err) {
+    // usuario bloqueou o bot, ignora
   }
 }
 }
-startApp();
 
-//commit forçando atualização
+startApp();
