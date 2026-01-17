@@ -542,42 +542,33 @@ _⏳ Aguardando pagamento... Assim que confirmado, esta mensagem sumirá e o sal
 
 /*============ RESPOSTA PAGAMENTO (FINAL) =========== */
 /*============ RESPOSTA PAGAMENTO (FINAL/DEBUG) =========== */
+/*============ RESPOSTA PAGAMENTO (FINAL BLINDADO) =========== */
 app.post('/webhook/mercadopago', async (req, res) => {
   res.sendStatus(200);
 
   try {
     const body = req.body;
-    // console.log('🔔 Webhook:', JSON.stringify(body)); // Comentei para limpar o log, descomente se quiser
-
-    // 1. Extração Inteligente do ID (Resolve o problema do "topic: payment")
+    
+    // 1. Extração Inteligente do ID
     let paymentIdRaw = body.data?.id || body.id || body.resource;
     
-    // Às vezes o resource vem como URL completa, pegamos só o final (número)
+    // Tratamento para URLs no resource
     if (paymentIdRaw && String(paymentIdRaw).includes('/')) {
         const partes = String(paymentIdRaw).split('/');
         paymentIdRaw = partes[partes.length - 1];
     }
 
-    if (!paymentIdRaw) return; // Se não tem ID, ignora
+    if (!paymentIdRaw) return; 
 
     const paymentId = String(paymentIdRaw);
     
     // 2. Verifica se o pagamento existe no NOSSO banco
     const pDb = await pagamentos().findOne({ paymentId });
     
-    if (!pDb) {
-        // Se não achou no banco, ignora (pode ser pagamento antigo ou de outro bot)
-        return;
-    }
-    
-    if (pDb.confirmado) {
-        // Já foi confirmado antes, não faz nada
-        return;
-    }
+    if (!pDb) return; // Não existe ou não é nosso
+    if (pDb.confirmado) return; // Já pago, ignora duplicações
 
-    console.log(`🔎 Verificando pagamento ${paymentId} no MP...`);
-
-    // 3. Pergunta pro Mercado Pago o status ATUAL
+    // 3. Consulta status no Mercado Pago
     let mpStatus = 'unknown';
     let valorPago = 0;
     
@@ -587,60 +578,50 @@ app.post('/webhook/mercadopago', async (req, res) => {
         mpStatus = mpData.status;
         valorPago = Number(mpData.transaction_amount);
     } catch (e) {
-        console.error(`❌ Erro ao consultar MP: ${e.message}`);
+        console.error(`❌ Erro MP: ${e.message}`);
         return;
     }
 
-    console.log(`📊 Status no MP: ${mpStatus} | Valor: ${valorPago}`);
+    // 4. Se não aprovou, tchau
+    if (mpStatus !== 'approved') return;
 
-    // 4. Se não estiver aprovado, para aqui
-    if (mpStatus !== 'approved') {
-        return;
-    }
-
-    // 5. Validação de Segurança do Valor
-    if (Math.abs(valorPago - pDb.valor) > 0.05) { // Margem de 5 centavos
-        console.error(`⚠️ Fraude? Valor pago (${valorPago}) diferente do gerado (${pDb.valor})`);
-        return;
-    }
-
-    // 6. Confirmação Atômica (Previne saldo duplo)
+    // 5. Trava de Segurança (Atomicidade)
     const locked = await pagamentos().findOneAndUpdate(
       { paymentId, confirmado: false },
       { $set: { confirmado: true, confirmadoEm: new Date(), mpStatus: mpStatus } },
       { returnDocument: 'after' }
     );
 
-    if (!locked.value && !locked) return; // Já processado por outra requisição
+    // --- CORREÇÃO DO ERRO NULL ---
+    if (!locked) return; // Se for null, outro processo já pegou. Para aqui.
+    
+    const pag = locked.value || locked; // Garante compatibilidade
+    if (!pag) return; // Segurança extra
 
     console.log(`🚀 PAGAMENTO APROVADO! ID: ${paymentId} (+R$ ${valorPago})`);
 
-    // 7. Entrega o Saldo
+    // 6. Credita saldo
     await users().updateOne({ chatId: pDb.chatId }, { $inc: { saldo: valorPago } });
 
-    // 8. Notifica e Limpa
+    // 7. Limpa mensagens
     const apagar = async (id) => { try { await bot.deleteMessage(pDb.chatId, id); } catch(e){} };
     await apagar(pDb.msgPixId);
     await apagar(pDb.msgFotoId);
 
+    // 8. Avisa usuário
     try {
-      const userAtual = await getUser(pDb.chatId); // Pega saldo novo
-      
+      const userAtual = await getUser(pDb.chatId);
       await enviarMensagemComRetry(
         pDb.chatId,
-        `✅ *Pagamento Confirmado!*\n\n💰 + R$ ${valorPago.toFixed(2)} adicionados ao seu saldo.`,
+        `✅ *Pagamento Confirmado!*\n\n💰 + R$ ${valorPago.toFixed(2)} adicionados.`,
         { parse_mode: 'Markdown' }
       );
-      
       const menu = menuPrincipal(userAtual);
       await enviarMensagemComRetry(pDb.chatId, menu.text, menu.opts);
-      
-    } catch (e) {
-        console.error('Erro ao notificar usuário:', e.message);
-    }
+    } catch (e) {}
 
   } catch (err) {
-    console.error('Erro Crítico Webhook:', err);
+    console.error('Erro Webhook:', err.message);
   }
 });
 
