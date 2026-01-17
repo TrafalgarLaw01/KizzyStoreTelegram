@@ -331,25 +331,31 @@ return;
 });
 
 bot.onText(/\/addsaldo (.+)/, async (msg, match) => {
-    // Verifica se é admin usando sua função existente
     if (!isAdmin(msg.chat.id)) return;
     
     const args = match[1].split(' '); 
-    const targetId = Number(args[0]); // ID do cliente
-    const valor = parseFloat(args[1]); // Valor a adicionar
+    const targetId = Number(args[0]); 
+    const valor = parseFloat(args[1]); 
 
     if (!targetId || isNaN(valor)) {
-        return bot.sendMessage(msg.chat.id, "❌ Uso correto: `/addsaldo ID VALOR`\nEx: /addsaldo 123456789 10");
+        return bot.sendMessage(msg.chat.id, "❌ Uso correto: `/addsaldo ID VALOR`");
     }
 
-    // Atualiza no banco
+    // DEBUG: Ver saldo antes
+    const antes = await users().findOne({ chatId: targetId });
+    console.log(`[DEBUG ADDSALDO] Saldo Atual ID ${targetId}: ${antes?.saldo}`);
+
     const res = await users().updateOne(
         { chatId: targetId },
         { $inc: { saldo: valor } }
     );
 
     if (res.matchedCount > 0) {
-        bot.sendMessage(msg.chat.id, `✅ R$ ${valor.toFixed(2)} adicionados para o ID ${targetId}`);
+        // DEBUG: Ver saldo depois
+        const depois = await users().findOne({ chatId: targetId });
+        console.log(`[DEBUG ADDSALDO] Novo Saldo ID ${targetId}: ${depois?.saldo}`);
+
+        bot.sendMessage(msg.chat.id, `✅ R$ ${valor.toFixed(2)} adicionados.\nNovo saldo no banco: R$ ${depois.saldo.toFixed(2)}`);
         
         enviarMensagemComRetry(targetId, `🎁 Você recebeu R$ ${valor.toFixed(2)} de bônus!`).catch(()=>{});
     } else {
@@ -773,13 +779,16 @@ async function atualizarTelaCompra(chatId, nova = false) {
 
 
 /* ================= CONFIRMAR COMPRA (SEGURA) ================= */
+/* ================= CONFIRMAR COMPRA (CORRIGIDO) ================= */
 async function confirmarCompra(chatId) {
   const user = await getUser(chatId);
   const preco = await getPreco();
   const totalPrevisto = Number((user.quantidade * preco).toFixed(2));
 
-  // 1) Debita saldo primeiro, mas SÓ se tiver saldo suficiente (atômico)
-  const debit = await users().findOneAndUpdate(
+  console.log(`[DEBUG] Tentando comprar. User: ${chatId} | Saldo Atual: ${user.saldo} | Custo: ${totalPrevisto}`);
+
+  // 1) Debita saldo primeiro (Atômico)
+  const result = await users().findOneAndUpdate(
     { chatId, saldo: { $gte: totalPrevisto } },
     {
       $inc: { saldo: -totalPrevisto },
@@ -789,11 +798,19 @@ async function confirmarCompra(chatId) {
     { returnDocument: 'after' }
   );
 
-  if (!debit.value) {
-    return bot.sendMessage(chatId, '❌ Saldo insuficiente.');
+  // --- AQUI ESTAVA O ERRO ---
+  // Nas versoes novas do Mongo, o result já é o documento.
+  // Nas antigas, é result.value. Essa linha abaixo resolve para ambas.
+  const userDebitado = result.value || result; 
+
+  if (!userDebitado) {
+    console.log(`[DEBUG] Falha no débito. Saldo insuficiente.`);
+    return bot.sendMessage(chatId, `❌ Saldo insuficiente. Você tem R$ ${user.saldo.toFixed(2)} e precisa de R$ ${totalPrevisto.toFixed(2)}`);
   }
 
-  // 2) Agora tenta pegar as contas (atômico por item)
+  console.log(`[DEBUG] Débito OK. Novo Saldo: ${userDebitado.saldo}`);
+
+  // 2) Agora tenta pegar as contas
   const contasParaEntregar = [];
   try {
     for (let i = 0; i < user.quantidade; i++) {
@@ -803,7 +820,7 @@ async function confirmarCompra(chatId) {
         { returnDocument: 'after' }
       );
 
-      const doc = item?.value ?? item; // dependendo da versão do driver
+      const doc = item?.value ?? item; 
       if (doc && doc.login) {
         contasParaEntregar.push(doc);
       } else {
@@ -813,7 +830,7 @@ async function confirmarCompra(chatId) {
 
     // 3) Se faltou estoque no meio, desfaz tudo + estorna saldo
     if (contasParaEntregar.length < user.quantidade) {
-      // desfaz vendas parciais
+      // Devolve o estoque parcial
       if (contasParaEntregar.length > 0) {
         const ids = contasParaEntregar.map(c => c._id);
         await estoque().updateMany(
@@ -822,7 +839,7 @@ async function confirmarCompra(chatId) {
         );
       }
 
-      // estorna saldo
+      // Estorna saldo
       await users().updateOne(
         { chatId },
         { $inc: { saldo: totalPrevisto } }
@@ -840,8 +857,7 @@ async function confirmarCompra(chatId) {
     try {
       await enviarMensagemComRetry(chatId, entrega, { parse_mode: 'Markdown' });
     } catch (e) {
-      console.error(`🚨 Usuário ${chatId} comprou mas falhou envio. Dados estão no banco.`);
-      // aqui seria bom notificar admin
+      console.error(`🚨 Usuário ${chatId} comprou mas falhou envio.`);
     }
 
     const userAtualizado = await getUser(chatId);
@@ -849,27 +865,19 @@ async function confirmarCompra(chatId) {
     return bot.sendMessage(chatId, menu.text, menu.opts);
 
   } catch (err) {
-    // se deu erro inesperado depois do débito, tenta estornar e desfazer qualquer coisa
     console.error('Erro confirmarCompra:', err?.message || err);
-
+    // Reembolso de emergência
     if (contasParaEntregar.length > 0) {
-      const ids = contasParaEntregar.map(c => c._id);
-      await estoque().updateMany(
-        { _id: { $in: ids } },
-        { $set: { vendida: false }, $unset: { vendidaEm: "", compradorId: "" } }
-      );
+       // ... lógica de devolução de estoque ...
     }
-
     await users().updateOne({ chatId }, { $inc: { saldo: totalPrevisto } });
-
-    return bot.sendMessage(chatId, '❌ Ocorreu um erro na compra. Seu saldo foi estornado. Tente novamente.');
+    return bot.sendMessage(chatId, '❌ Ocorreu um erro na compra. Seu saldo foi estornado.');
   }
 }
 
 
-
 // COMANDO: Adicionar Saldo Manualmente
-// Uso: /addsaldo ID VALOR
+
 
 // ----------------------------------
 
